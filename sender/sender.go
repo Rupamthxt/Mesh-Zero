@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -14,12 +15,20 @@ import (
 )
 
 type senderNotifee struct {
-	h    host.Host
-	ctx  context.Context
-	done chan bool
+	h       host.Host
+	ctx     context.Context
+	done    chan bool
+	mu      sync.Mutex
+	hasSent bool
 }
 
 func (n *senderNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	n.mu.Lock()
+	if n.hasSent {
+		n.mu.Unlock()
+		return
+	}
+	n.mu.Unlock()
 	// Skip ourselves
 	if pi.ID == n.h.ID() {
 		return
@@ -32,6 +41,7 @@ func (n *senderNotifee) HandlePeerFound(pi peer.AddrInfo) {
 
 	fmt.Printf("\n[mDNS] Found Worker: %s\n", pi.ID)
 	fmt.Printf(" -> Available IPs: %v\n", pi.Addrs)
+	fmt.Printf("\n[mDNS] Attempting Worker: %s\n", pi.ID)
 
 	// Attempt Connection (NO PANICS ALLOWED)
 	err := n.h.Connect(n.ctx, pi)
@@ -48,6 +58,15 @@ func (n *senderNotifee) HandlePeerFound(pi peer.AddrInfo) {
 		return
 	}
 	defer s.Close()
+	n.mu.Lock()
+	if n.hasSent {
+		// We were beaten by another thread just milliseconds ago.
+		s.Close()
+		n.mu.Unlock()
+		return
+	}
+	n.hasSent = true // WE CLAIM THE TASK!
+	n.mu.Unlock()
 
 	// Ensure the file exists
 	wasmBytes, err := os.ReadFile("task.wasm")
@@ -76,7 +95,7 @@ func (n *senderNotifee) HandlePeerFound(pi peer.AddrInfo) {
 }
 
 func main() {
-	// 1. Force the sender to use IPv4 localhost as well
+	// Force the sender to use IPv4 localhost as well
 	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"))
 	if err != nil {
 		fmt.Printf("Fatal host error: %v\n", err)
@@ -87,7 +106,7 @@ func main() {
 	ctx := context.Background()
 	done := make(chan bool)
 
-	// 2. Start mDNS
+	// Start mDNS
 	rendezvous := "mesh-zero-local-v1"
 	notifee := &senderNotifee{h: h, ctx: ctx, done: done}
 
