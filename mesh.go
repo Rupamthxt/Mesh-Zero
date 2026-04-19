@@ -12,7 +12,10 @@ import (
 
 	"github.com/libp2p/go-libp2p"
 	// "github.com/libp2p/go-libp2p/core/host"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
+	"github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
@@ -30,8 +33,19 @@ func main() {
 		panic(err)
 	}
 
-	addr := fmt.Sprintf("%s/p2p/%s", h.Addrs()[0].String(), h.ID().String())
-	fmt.Printf("Worker Node listening on: %s\n", addr)
+	kDHT, _ := dht.New(ctx, h)
+
+	if err = kDHT.Bootstrap(ctx); err != nil {
+		panic(err)
+	}
+
+	routingDiscovery := routing.NewRoutingDiscovery(kDHT)
+	rendezvousString := "mesh-zero-compute-pool-v1"
+	util.Advertise(ctx, routingDiscovery, rendezvousString)
+	fmt.Println("Worker announced to DHT. Waiting for tasks...")
+
+	// addr := fmt.Sprintf("%s/p2p/%s", h.Addrs()[0].String(), h.ID().String())
+	// fmt.Printf("Worker Node listening on: %s\n", addr)
 
 	h.SetStreamHandler("/mesh-zero/task/1.0.0", func(s network.Stream) {
 		handleTaskStream(ctx, s)
@@ -43,53 +57,6 @@ func main() {
 	fmt.Println("\nShutting down Mesh-Zero node...")
 	h.Close()
 }
-
-// func handleTaskStream(ctx context.Context, s network.Stream) {
-// 	defer s.Close()
-
-// 	// Read Header : Verification(4) + Wasm Length(4) + Param length(4)
-// 	header := make([]byte, 12)
-
-// 	if _, err := io.ReadFull(s, header); err != nil {
-// 		return
-// 	}
-
-// 	if string(header[:4]) != "MZ01" {
-// 		return
-// 	}
-
-// 	wasmLen := binary.BigEndian.Uint32(header[4:8])
-// 	paramLen := binary.BigEndian.Uint32(header[8:12])
-
-// 	wasmBin := make([]byte, wasmLen)
-// 	io.ReadFull(s, wasmBin)
-
-// 	paramBin := make([]byte, paramLen)
-// 	io.ReadFull(s, paramBin)
-
-// 	runWasmTask(ctx, wasmBin, paramBin, s)
-// }
-
-// func runWasmTask(ctx context.Context, wasm []byte, param []byte, out io.Writer) {
-// 	r := wazero.NewRuntime(ctx)
-// 	defer r.Close(ctx)
-
-// 	wasi_snapshot_preview1.MustInstantiate(ctx, r)
-
-// 	compiledMod, err := r.CompileModule(ctx, wasm)
-// 	if err != nil {
-// 		fmt.Fprintf(out, "Compilation error: %v\n", err)
-// 		return
-// 	}
-
-// 	config := wazero.NewModuleConfig().WithStdin(bytes.NewReader(param)).WithStdout(out).WithEnv("NODE_ID", "Local-01")
-
-// 	_, err = r.InstantiateModule(ctx, compiledMod, config)
-// 	if err != nil {
-// 		fmt.Printf("Error instantiating Wasm module: %v\n", err)
-// 		return
-// 	}
-// }
 
 func handleTaskStream(ctx context.Context, s network.Stream) {
 	defer s.Close()
