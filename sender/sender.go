@@ -77,7 +77,7 @@ func (n *senderNotifee) HandlePeerFound(pi peer.AddrInfo) {
 
 func main() {
 	// 1. Force the sender to use IPv4 localhost as well
-	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"))
 	if err != nil {
 		fmt.Printf("Fatal host error: %v\n", err)
 		return
