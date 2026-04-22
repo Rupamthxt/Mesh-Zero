@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -23,10 +24,13 @@ func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	fmt.Printf("[mDNS] Worker saw peer on network: %s\n", pi.ID)
 }
 
+var completedTasks = make(map[uint64]bool)
+var taskMu sync.Mutex
+
 func main() {
 	ctx := context.Background()
 
-	// 1. Lock to IPv4 localhost to bypass firewall roulette
+	// Lock to IPv4 localhost to bypass firewall roulette
 	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"))
 	if err != nil {
 		fmt.Printf("Fatal host error: %v\n", err)
@@ -34,12 +38,12 @@ func main() {
 	}
 	defer h.Close()
 
-	// 2. Set up the Stream Handler
+	// Set up the Stream Handler
 	h.SetStreamHandler("/mesh-zero/task/1.0.0", func(s network.Stream) {
 		handleTaskStream(ctx, s)
 	})
 
-	// 3. Start mDNS Discovery
+	// Start mDNS Discovery
 	rendezvous := "mesh-zero-local-v1"
 	mdnsService := mdns.NewMdnsService(h, rendezvous, &discoveryNotifee{})
 	if err := mdnsService.Start(); err != nil {
@@ -48,22 +52,32 @@ func main() {
 	}
 
 	fmt.Printf("Worker Node %s listening on Localhost. Waiting for tasks...\n", h.ID())
-	select {} // Block forever
+	select {}
 }
 
 func handleTaskStream(ctx context.Context, s network.Stream) {
 	defer s.Close()
 
-	header := make([]byte, 12)
+	header := make([]byte, 20)
 	if _, err := io.ReadFull(s, header); err != nil {
 		return
 	}
-	if string(header[:4]) != "MZ01" {
+	if string(header[:4]) != "MZ02" {
 		return
 	}
 
-	wasmLen := binary.BigEndian.Uint32(header[4:8])
-	paramLen := binary.BigEndian.Uint32(header[8:12])
+	taskID := binary.BigEndian.Uint64(header[4:12])
+	wasmLen := binary.BigEndian.Uint32(header[12:16])
+	paramLen := binary.BigEndian.Uint32(header[16:20])
+
+	taskMu.Lock()
+	if completedTasks[taskID] {
+		fmt.Printf("Worker already executed Task %d. Ignoring.\n", taskID)
+		taskMu.Unlock()
+		return
+	}
+	completedTasks[taskID] = true
+	taskMu.Unlock()
 
 	wasmBin := make([]byte, wasmLen)
 	io.ReadFull(s, wasmBin)

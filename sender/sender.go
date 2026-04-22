@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -78,11 +79,14 @@ func (n *senderNotifee) HandlePeerFound(pi peer.AddrInfo) {
 
 	paramBytes := []byte(`{"vector": [0.1, 0.5, 0.9], "k": 5}`)
 
+	taskId := uint64(time.Now().UnixNano())
+
 	// Construct and send payload
-	header := make([]byte, 12)
-	copy(header[:4], "MZ01")
-	binary.BigEndian.PutUint32(header[4:8], uint32(len(wasmBytes)))
-	binary.BigEndian.PutUint32(header[8:12], uint32(len(paramBytes)))
+	header := make([]byte, 20)
+	copy(header[:4], "MZ02")
+	binary.BigEndian.PutUint64(header[4:12], taskId)
+	binary.BigEndian.PutUint32(header[12:16], uint32(len(wasmBytes)))
+	binary.BigEndian.PutUint32(header[16:20], uint32(len(paramBytes)))
 
 	s.Write(header)
 	s.Write(wasmBytes)
