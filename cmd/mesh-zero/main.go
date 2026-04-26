@@ -54,12 +54,18 @@ func handleWorkerCommand() {
 	}
 
 	subCommand := os.Args[2]
+
+	apiPort := "8080"
+	if len(os.Args) >= 4 {
+		apiPort = os.Args[3]
+	}
+
 	if subCommand == "start" {
 		fmt.Println("Starting Mesh-Zero Node in foreground...")
 		worker := &core.Worker{
 			Hooks: nil,
 		}
-		worker.Start(context.Background())
+		worker.Start(context.Background(), true, apiPort)
 		return
 	}
 

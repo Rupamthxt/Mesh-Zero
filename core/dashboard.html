@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mesh-Zero Control Plane</title>
+    <style>
+        body { font-family: ui-sans-serif, system-ui, sans-serif; background: #0f172a; color: #f8fafc; padding: 2rem; max-width: 800px; margin: 0 auto; }
+        .card { background: #1e293b; padding: 1.5rem; border-radius: 8px; border: 1px solid #334155; margin-bottom: 1.5rem; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
+        h1 { color: #38bdf8; margin-top: 0; }
+        h2 { font-size: 1.25rem; margin-top: 0; color: #cbd5e1; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; }
+        label { display: block; margin-bottom: 0.5rem; font-size: 0.875rem; color: #94a3b8; }
+        select, input[type="file"] { width: 100%; padding: 0.5rem; background: #0f172a; border: 1px solid #334155; color: white; border-radius: 4px; margin-bottom: 1rem; }
+        button { background: #0284c7; color: white; border: none; padding: 0.5rem 1rem; border-radius: 4px; cursor: pointer; font-weight: bold; width: 100%; transition: background 0.2s; }
+        button:hover { background: #0369a1; }
+        pre { background: #020617; padding: 1rem; border-radius: 4px; overflow-x: auto; font-size: 0.875rem; color: #a7f3d0; border: 1px solid #1e293b; }
+    </style>
+</head>
+<body>
+
+    <h1>🕸️ Mesh-Zero Control Plane</h1>
+
+    <div class="card">
+        <h2>Network Topology</h2>
+        <button onclick="fetchPeers()" style="width: auto; margin-bottom: 1rem;">🔄 Scan Local Mesh</button>
+        <pre id="peer-list">Initializing discovery...</pre>
+    </div>
+
+    <div class="card">
+        <h2>Deploy Task Payload</h2>
+        <form id="deploy-form" onsubmit="deployTask(event)">
+            <label for="peer-select">Target Mesh Node</label>
+            <select id="peer-select" required>
+                <option value="">No peers found...</option>
+            </select>
+
+            <label for="wasm-file">WASM Executable (.wasm)</label>
+            <input type="file" id="wasm-file" accept=".wasm" required>
+
+            <label for="data-file">Input Data (Stdin)</label>
+            <input type="file" id="data-file" required>
+
+            <button type="submit" id="deploy-btn">🚀 Deploy to Edge Node</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <h2>Execution Stream</h2>
+        <pre id="result-log">Waiting for workload...</pre>
+    </div>
+
+    <script>
+        async function fetchPeers() {
+            try {
+                const res = await fetch('/api/peers');
+                const data = await res.json();
+                
+                document.getElementById('peer-list').innerText = JSON.stringify(data, null, 2);
+                
+                const select = document.getElementById('peer-select');
+                select.innerHTML = '';
+                
+                if (data.peers && data.peers.length > 0) {
+                    data.peers.forEach(p => {
+                        const opt = document.createElement('option');
+                        opt.value = p;
+                        opt.innerText = p;
+                        select.appendChild(opt);
+                    });
+                } else {
+                    select.innerHTML = '<option value="">Waiting for peers...</option>';
+                }
+            } catch (err) {
+                document.getElementById('peer-list').innerText = "Error connecting to local gateway.";
+            }
+        }
+
+        async function deployTask(e) {
+            e.preventDefault();
+            const log = document.getElementById('result-log');
+            const btn = document.getElementById('deploy-btn');
+            
+            btn.innerText = "⏳ Transmitting Payload...";
+            btn.disabled = true;
+            log.innerText = "[Gateway] Negotiating MZ02 protocol with mesh...\n";
+
+            const formData = new FormData();
+            formData.append('peer_id', document.getElementById('peer-select').value);
+            formData.append('wasm', document.getElementById('wasm-file').files[0]);
+            formData.append('data', document.getElementById('data-file').files[0]);
+
+            try {
+                const startTime = performance.now();
+                const res = await fetch('/api/execute', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const text = await res.text();
+                const latency = Math.round(performance.now() - startTime);
+                
+                log.innerText += `[Gateway] Stream closed. Round-trip latency: ${latency}ms\n\n`;
+                log.innerText += `--- WASM STDOUT ---\n${text}`;
+            } catch (err) {
+                log.innerText += `\n[Fatal] Mesh transmission failed: ${err}`;
+            } finally {
+                btn.innerText = "🚀 Deploy to Edge Node";
+                btn.disabled = false;
+            }
+        }
+
+        // Auto-fetch peers on load
+        fetchPeers();
+    </script>
+</body>
+</html>

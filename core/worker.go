@@ -16,7 +16,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/routing"
-	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+
+	// "github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/tetratelabs/wazero"
@@ -30,16 +31,16 @@ type Worker struct {
 	Hooks []ExtensionHook
 }
 
-type discoveryNotifee struct{}
+// type discoveryNotifee struct{}
 
-func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
-	fmt.Printf("[mDNS] Worker saw peer on network: %s\n", pi.ID)
-}
+// func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
+// 	fmt.Printf("[mDNS] Worker saw peer on network: %s\n", pi.ID)
+// }
 
 var completedTasks = make(map[uint64]bool)
 var taskMu sync.Mutex
 
-func (w *Worker) Start(ctx context.Context) error {
+func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) error {
 
 	var relays []peer.AddrInfo
 	for _, peerAddr := range dht.DefaultBootstrapPeers {
@@ -111,6 +112,7 @@ func (w *Worker) Start(ctx context.Context) error {
 						err := h.Connect(ctx, pi)
 						if err == nil {
 							fmt.Printf("[DHT] Discovered Mesh-Zero node: %s\n", pi.ID.String()[:10])
+							h.Peerstore().Put(pi.ID, "rendezvous", rendezvous)
 						}
 					}
 				}
@@ -123,10 +125,11 @@ func (w *Worker) Start(ctx context.Context) error {
 		w.handleTaskStream(ctx, s)
 	})
 
-	mdnsService := mdns.NewMdnsService(h, rendezvous, &discoveryNotifee{})
-	if err := mdnsService.Start(); err != nil {
-		fmt.Printf("Fatal mDNS error: %v\n", err)
-		return nil
+	if enableApi {
+		if apiPort == "" {
+			apiPort = "8080" // Fallback default
+		}
+		go w.StartAPIServer(apiPort)
 	}
 
 	fmt.Printf("Worker Node %s listening. Waiting for tasks...\n", h.ID())

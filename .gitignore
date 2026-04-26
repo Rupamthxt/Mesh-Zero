@@ -1,3 +1,4 @@
 *.log
 *.wasm
 *.pid
+*.txt
