@@ -25,26 +25,16 @@ type Worker struct {
 	Hooks []ExtensionHook
 }
 
-type discoveryNotifee struct {
-	h host.Host
-}
+type discoveryNotifee struct{}
 
 func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
-	if pi.ID == n.h.ID() {
-		return
-	}
-
-	// Actively open a connection to the discovered peer
-	err := n.h.Connect(context.Background(), pi)
-	if err == nil {
-		fmt.Printf("[mDNS] Actively connected to mesh node: %s\n", pi.ID)
-	}
+	fmt.Printf("[mDNS] Worker saw peer on network: %s\n", pi.ID)
 }
 
 var completedTasks = make(map[uint64]bool)
 var taskMu sync.Mutex
 
-func (w *Worker) Start(ctx context.Context, enableAPI bool, apiPort string) error {
+func (w *Worker) Start(ctx context.Context) error {
 	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"))
 	if err != nil {
 		fmt.Printf("Fatal host error: %v\n", err)
@@ -52,21 +42,15 @@ func (w *Worker) Start(ctx context.Context, enableAPI bool, apiPort string) erro
 	}
 	defer h.Close()
 
-	w.Host = h
-
 	h.SetStreamHandler("/mesh-zero/task/1.0.0", func(s network.Stream) {
 		w.handleTaskStream(ctx, s)
 	})
 
 	rendezvous := "mesh-zero-local-v1"
-	mdnsService := mdns.NewMdnsService(h, rendezvous, &discoveryNotifee{h: h})
+	mdnsService := mdns.NewMdnsService(h, rendezvous, &discoveryNotifee{})
 	if err := mdnsService.Start(); err != nil {
 		fmt.Printf("Fatal mDNS error: %v\n", err)
 		return nil
-	}
-
-	if enableAPI {
-		go w.StartAPIServer(apiPort)
 	}
 
 	fmt.Printf("Worker Node %s listening on Localhost. Waiting for tasks...\n", h.ID())

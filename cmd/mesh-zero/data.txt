@@ -1,0 +1,1 @@
+Mesh-Zero is a generalized decentralized compute platform.

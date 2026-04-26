@@ -54,18 +54,12 @@ func handleWorkerCommand() {
 	}
 
 	subCommand := os.Args[2]
-
-	apiPort := "8080"
-	if len(os.Args) >= 4 {
-		apiPort = os.Args[3]
-	}
-
 	if subCommand == "start" {
 		fmt.Println("Starting Mesh-Zero Node in foreground...")
 		worker := &core.Worker{
 			Hooks: nil,
 		}
-		worker.Start(context.Background(), true, apiPort)
+		worker.Start(context.Background())
 		return
 	}
 
@@ -73,7 +67,7 @@ func handleWorkerCommand() {
 		fmt.Println("Spawning Mesh-Zero daemon...")
 
 		binaryPath, _ := os.Executable()
-		cmd := exec.Command(binaryPath, "worker", "start", apiPort)
+		cmd := exec.Command(binaryPath, "worker", "start")
 
 		logFile, err := os.OpenFile("mesh-zero.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 		if err != nil {
@@ -90,7 +84,7 @@ func handleWorkerCommand() {
 		}
 
 		pidStr := fmt.Sprintf("%d", cmd.Process.Pid)
-		os.WriteFile("mesh-zero-"+apiPort+".pid", []byte(pidStr), 0644)
+		os.WriteFile("mesh-zero.pid", []byte(pidStr), 0644)
 
 		fmt.Printf("Daemon running in background. (PID: %d)\n", cmd.Process.Pid)
 		fmt.Println("Check mesh-zero.log for node output.")
