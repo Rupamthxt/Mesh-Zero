@@ -51,7 +51,7 @@ Worker Node 12D3KooW... listening on Localhost. Waiting for tasks...
 ### 2. Compile a WASM task
 Write a generic task in Go. Mesh-Zero uses `os.Stdin` to inject parameters and `os.Stdout` to stream results.
 ```bash
-// hasher.go
+# hasher.go
 package main
 
 import (
