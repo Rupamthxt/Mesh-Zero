@@ -1,6 +1,7 @@
 package main
 
 import (
+	"C"
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
@@ -12,6 +13,34 @@ import (
 
 	"github.com/rupamthxt/mesh-zero/core"
 )
+
+var meshWorker *core.Worker
+var ffiCancel context.CancelFunc
+
+//export StartMeshDaemon
+func StartMeshDaemon() {
+	if meshWorker != nil {
+		fmt.Println("[FFI] Mesh daemon is already running.")
+		return
+	}
+	fmt.Println("[FFI] Booting Mesh-Zero engine from Flutter UI...")
+	ctx, cancel := context.WithCancel(context.Background())
+	ffiCancel = cancel
+	meshWorker = &core.Worker{}
+
+	go func() {
+		meshWorker.Start(ctx, true, "8080")
+	}()
+}
+
+//export StopMeshDaemon
+func StopMeshDaemon() {
+	if ffiCancel != nil {
+		fmt.Println("[FFI] Shutting down Mesh-Zero engine...")
+		ffiCancel()
+		meshWorker = nil
+	}
+}
 
 func main() {
 	if len(os.Args) < 2 {
