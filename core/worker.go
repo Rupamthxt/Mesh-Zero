@@ -20,6 +20,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/routing"
 	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
+	libp2pquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
@@ -29,6 +30,20 @@ type ExtensionHook func(context.Context, wazero.Runtime) error
 type Worker struct {
 	Host  host.Host
 	Hooks []ExtensionHook
+}
+
+type NodeCapabilities struct {
+	HasGPU       bool
+	MaxRAm       uint64
+	IsMobile     bool
+	SupportsWASI bool
+}
+
+var currentNodeCapabilities = NodeCapabilities{
+	HasGPU:       false,
+	MaxRAm:       512 * 1024 * 1024, // 512MB RAM limit for tasks
+	IsMobile:     false,
+	SupportsWASI: true,
 }
 
 var completedTasks = make(map[uint64]bool)
@@ -46,7 +61,10 @@ func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) erro
 
 	var kdht *dht.IpfsDHT
 	h, err := libp2p.New(
-		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
+		libp2p.ListenAddrStrings(
+			"/ip4/0.0.0.0/tcp/0",
+		),
+		libp2p.Transport(libp2pquic.NewTransport),
 		libp2p.NATPortMap(),
 		libp2p.EnableAutoRelayWithStaticRelays(relays),
 		libp2p.Routing(func(n host.Host) (routing.PeerRouting, error) {
@@ -61,6 +79,12 @@ func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) erro
 	}
 	defer h.Close()
 	w.Host = h
+
+	fmt.Println("========================================")
+	fmt.Println(" MESH-ZERO NODE INITIALIZED")
+	fmt.Printf("  Node ID: %s\n", w.Host.ID().String())
+	fmt.Printf("  GPU Accel: %v | Max RAM: %d MB\n", currentNodeCapabilities.HasGPU, currentNodeCapabilities.MaxRAm)
+	fmt.Println("========================================")
 
 	fmt.Println("Connecting to public bootstrap nodes....")
 	var wg sync.WaitGroup
@@ -202,7 +226,7 @@ func (w *Worker) runWasmTask(ctx context.Context, wasmBytes []byte, paramBytes [
 	}
 
 	compiledMod, err := r.CompileModule(timeoutCtx, wasmBytes)
-	if err != nil {
+	if err != nil { 
 		fmt.Fprintf(out, "Compilation error: %v\n", err)
 		return
 	}
