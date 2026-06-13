@@ -1,7 +1,6 @@
 package core
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/binary"
@@ -22,7 +21,6 @@ import (
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 	libp2pquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/tetratelabs/wazero"
-	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
 
 type ExtensionHook func(context.Context, wazero.Runtime) error
@@ -204,46 +202,5 @@ func (w *Worker) handleTaskStream(ctx context.Context, s network.Stream) {
 	io.ReadFull(s, paramBin)
 
 	fmt.Printf("\n[WORKER] Task Received! WASM: %dB, Params: %dB\n", wasmLen, paramLen)
-	w.runWasmTask(ctx, wasmBin, paramBin, s)
-}
-
-func (w *Worker) runWasmTask(ctx context.Context, wasmBytes []byte, paramBytes []byte, out io.Writer) {
-
-	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	config := wazero.NewRuntimeConfig().WithMemoryLimitPages(100)
-	r := wazero.NewRuntimeWithConfig(ctx, config)
-	defer r.Close(timeoutCtx)
-
-	wasi_snapshot_preview1.MustInstantiate(ctx, r)
-
-	for _, hook := range w.Hooks {
-		if err := hook(ctx, r); err != nil {
-			fmt.Fprintf(out, "Failed to load extension hook: %v\n", err)
-			return
-		}
-	}
-
-	compiledMod, err := r.CompileModule(timeoutCtx, wasmBytes)
-	if err != nil { 
-		fmt.Fprintf(out, "Compilation error: %v\n", err)
-		return
-	}
-
-	mod, err := r.InstantiateModule(timeoutCtx, compiledMod, wazero.NewModuleConfig().
-		WithStdout(out).
-		WithStderr(out).
-		WithStdin(bytes.NewReader(paramBytes)))
-
-	if err != nil {
-		if timeoutCtx.Err() == context.DeadlineExceeded {
-			fmt.Fprintf(out, "[SYSTEM KILL] Task exceeded 5-second execution limit.\n")
-		} else {
-			fmt.Fprintf(out, "Execution failed: %v\n", err)
-		}
-		return
-	}
-	mod.Close(timeoutCtx)
-
+	executeWasm(ctx, wasmBin, paramBin, w.Hooks, s)
 }
