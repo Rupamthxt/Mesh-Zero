@@ -19,11 +19,13 @@ import (
 	"github.com/libp2p/go-libp2p/core/routing"
 	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
-	libp2pquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/tetratelabs/wazero"
 )
 
 type ExtensionHook func(context.Context, wazero.Runtime) error
+
+var DefaultHooks []ExtensionHook
 
 type Worker struct {
 	Host  host.Host
@@ -44,6 +46,14 @@ var currentNodeCapabilities = NodeCapabilities{
 	SupportsWASI: true,
 }
 
+type workerMdnsNotifee struct {
+	h host.Host
+}
+
+func (n *workerMdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	// No-op: The sender will initiate connection. Worker just needs to advertise itself.
+}
+
 var completedTasks = make(map[uint64]bool)
 var taskMu sync.Mutex
 
@@ -62,7 +72,6 @@ func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) erro
 		libp2p.ListenAddrStrings(
 			"/ip4/0.0.0.0/tcp/0",
 		),
-		libp2p.Transport(libp2pquic.NewTransport),
 		libp2p.NATPortMap(),
 		libp2p.EnableAutoRelayWithStaticRelays(relays),
 		libp2p.Routing(func(n host.Host) (routing.PeerRouting, error) {
@@ -140,6 +149,14 @@ func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) erro
 	h.SetStreamHandler("/mesh-zero/task/1.0.0", func(s network.Stream) {
 		w.handleTaskStream(ctx, s)
 	})
+
+	mdnsNotifee := &workerMdnsNotifee{h: h}
+	mdnsService := mdns.NewMdnsService(h, rendezvous, mdnsNotifee)
+	if err := mdnsService.Start(); err != nil {
+		fmt.Printf("[mDNS] Error starting service: %v\n", err)
+	} else {
+		fmt.Println("[mDNS] Local service started, advertising node...")
+	}
 
 	if enableApi {
 		if apiPort == "" {

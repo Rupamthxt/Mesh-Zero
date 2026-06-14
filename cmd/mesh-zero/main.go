@@ -26,7 +26,9 @@ func StartMeshDaemon() {
 	fmt.Println("[FFI] Booting Mesh-Zero engine from Flutter UI...")
 	ctx, cancel := context.WithCancel(context.Background())
 	ffiCancel = cancel
-	meshWorker = &core.Worker{}
+	meshWorker = &core.Worker{
+		Hooks: core.DefaultHooks,
+	}
 
 	go func() {
 		meshWorker.Start(ctx, true, "8080")
@@ -107,7 +109,7 @@ func handleWorkerCommand() {
 	if subCommand == "start" {
 		fmt.Println("Starting Mesh-Zero Node in foreground...")
 		worker := &core.Worker{
-			Hooks: nil,
+			Hooks: core.DefaultHooks,
 		}
 		worker.Start(context.Background(), true, apiPort)
 		return
