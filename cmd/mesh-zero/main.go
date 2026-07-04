@@ -53,17 +53,25 @@ func main() {
 	command := os.Args[1]
 
 	switch command {
+	case "broker":
+		handleBrokerCommand()
 	case "worker":
 		handleWorkerCommand()
 	case "run":
 		if len(os.Args) < 4 {
-			fmt.Println("Usage: mesh-zero run <task.wasm> <input.data>")
+			fmt.Println("Usage: mesh-zero run <task.wasm> <input.data> [max-price-per-ms]")
 			os.Exit(1)
 		}
 		wasmPath := os.Args[2]
 		inputPath := os.Args[3]
-		fmt.Printf("Submitting %s to the mesh...\n", wasmPath)
-		core.RunSender(wasmPath, inputPath)
+		maxPrice := 0.0
+		if len(os.Args) >= 5 {
+			if mp, err := strconv.ParseFloat(os.Args[4], 64); err == nil {
+				maxPrice = mp
+			}
+		}
+		fmt.Printf("Submitting %s to the mesh (Max Price: %.4f)...\n", wasmPath, maxPrice)
+		core.RunSender(wasmPath, inputPath, maxPrice)
 	case "keygen":
 		pub, priv, err := ed25519.GenerateKey(nil)
 		if err != nil {
@@ -84,12 +92,13 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Printf(`Mesh-Zero: Decentralized Compute Node
+	fmt.Printf(`Mesh-Zero: Centralized & Verifiable Compute Pool
 		Usage:
-		mesh-zero worker start    - Run the node in the foreground
-		mesh-zero worker daemon   - Run the node silently in the background
-		mesh-zero worker stop	  - Stop the background daemon
-		mesh-zero run <file>      - Submit a WASM task to the mesh
+		mesh-zero broker start [port]           - Start the central broker scheduler
+		mesh-zero worker start [port] [price]   - Run node in foreground with optional port & pricing rate
+		mesh-zero worker daemon [port] [price]  - Run node in background with optional port & pricing rate
+		mesh-zero worker stop	                - Stop the background daemon
+		mesh-zero run <file> <input> [budget]   - Submit a WASM task with maximum pricing budget
 		\n`)
 }
 
@@ -106,10 +115,18 @@ func handleWorkerCommand() {
 		apiPort = os.Args[3]
 	}
 
+	price := 0.01 // default
+	if len(os.Args) >= 5 {
+		if p, err := strconv.ParseFloat(os.Args[4], 64); err == nil {
+			price = p
+		}
+	}
+
 	if subCommand == "start" {
-		fmt.Println("Starting Mesh-Zero Node in foreground...")
+		fmt.Printf("Starting Mesh-Zero Node in foreground on port %s (Price: %.4f)...\n", apiPort, price)
 		worker := &core.Worker{
-			Hooks: core.DefaultHooks,
+			Hooks:      core.DefaultHooks,
+			PricePerMs: price,
 		}
 		worker.Start(context.Background(), true, apiPort)
 		return
@@ -119,7 +136,11 @@ func handleWorkerCommand() {
 		fmt.Println("Spawning Mesh-Zero daemon...")
 
 		binaryPath, _ := os.Executable()
-		cmd := exec.Command(binaryPath, "worker", "start")
+		args := []string{"worker", "start", apiPort}
+		if len(os.Args) >= 5 {
+			args = append(args, os.Args[4])
+		}
+		cmd := exec.Command(binaryPath, args...)
 
 		logFile, err := os.OpenFile("mesh-zero.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 		if err != nil {
@@ -170,5 +191,28 @@ func handleWorkerCommand() {
 		os.Remove("mesh-zero.pid")
 		fmt.Printf("Successfully stopped Mesh-zero daemon (PID: %d)\n", pid)
 		return
+	}
+}
+
+func handleBrokerCommand() {
+	if len(os.Args) < 3 {
+		fmt.Println("Usage: mesh-zero broker [start] [port]")
+		os.Exit(1)
+	}
+
+	subCommand := os.Args[2]
+	port := "8080"
+	if len(os.Args) >= 4 {
+		port = os.Args[3]
+	}
+
+	if subCommand == "start" {
+		broker := core.NewBroker()
+		err := broker.Start(port)
+		if err != nil {
+			fmt.Printf("Broker server error: %v\n", err)
+		}
+	} else {
+		fmt.Println("Unknown broker subcommand")
 	}
 }

@@ -1,145 +1,136 @@
 package core
 
 import (
-	"context"
-	"crypto/ed25519"
-	"encoding/binary"
-	"encoding/hex"
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
+	"net/http"
 	"os"
-	"sync"
-	"time"
-
-	"github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 )
 
-type senderNotifee struct {
-	h         host.Host
-	ctx       context.Context
-	wasmPath  string
-	inputPath string
-	done      chan bool
-	mu        sync.Mutex
-	hasSent   bool
-}
-
-func (n *senderNotifee) HandlePeerFound(pi peer.AddrInfo) {
-	n.mu.Lock()
-	if n.hasSent {
-		n.mu.Unlock()
-		return
-	}
-	n.mu.Unlock()
-	// Skip ourselves
-	if pi.ID == n.h.ID() {
-		return
-	}
-
-	if len(pi.Addrs) == 0 {
-		return
-	}
-
-	fmt.Printf("\n[mDNS] Found Worker: %s\n", pi.ID)
-	fmt.Printf(" -> Available IPs: %v\n", pi.Addrs)
-	fmt.Printf("\n[mDNS] Attempting Worker: %s\n", pi.ID)
-
-	err := n.h.Connect(n.ctx, pi)
+func RunSender(wasmPath, inputPath string, maxPrice float64) {
+	// Read input files
+	wasmBytes, err := os.ReadFile(wasmPath)
 	if err != nil {
-		fmt.Printf(" -> Connection skipped (likely unroutable interface): %v\n", err)
+		fmt.Printf("FATAL: Could not read WASM file: %v\n", err)
 		return
 	}
 
-	fmt.Println(" -> Connection established! Opening stream...")
-
-	s, err := n.h.NewStream(n.ctx, pi.ID, "/mesh-zero/task/1.0.0")
+	dataBytes, err := os.ReadFile(inputPath)
 	if err != nil {
-		fmt.Printf(" -> Failed to open stream: %v\n", err)
+		fmt.Printf("FATAL: Could not read data file: %v\n", err)
 		return
 	}
-	defer s.Close()
-	n.mu.Lock()
-	if n.hasSent {
-		s.Close()
-		n.mu.Unlock()
-		return
-	}
-	n.hasSent = true
-	n.mu.Unlock()
 
-	wasmFile := n.wasmPath
-	wasmBytes, err := os.ReadFile(wasmFile)
+	brokerAddr := os.Getenv("MESH_BROKER_ADDR")
+	if brokerAddr == "" {
+		brokerAddr = "localhost:8080"
+	}
+
+	fmt.Printf("[CLIENT] Sending task payload to Central Broker at %s...\n", brokerAddr)
+
+	// Create multipart request
+	bodyBuf := &bytes.Buffer{}
+	mw := multipart.NewWriter(bodyBuf)
+
+	// Attach data
+	dataPart, err := mw.CreateFormFile("data", "data.txt")
 	if err != nil {
-		fmt.Printf(" -> FATAL: Could not read task.wasm: %v\n", err)
-		n.done <- true
+		fmt.Printf("FATAL: Failed to package data: %v\n", err)
 		return
 	}
+	dataPart.Write(dataBytes)
 
-	inputFile := n.inputPath
-	paramBytes, err := os.ReadFile(inputFile)
+	// Attach wasm
+	wasmPart, err := mw.CreateFormFile("wasm", "task.wasm")
 	if err != nil {
-		fmt.Printf(" FATAL: Could not read input file %s\n", inputFile)
-		n.done <- true
+		fmt.Printf("FATAL: Failed to package WASM: %v\n", err)
 		return
 	}
+	wasmPart.Write(wasmBytes)
 
-	taskId := uint64(time.Now().UnixNano())
+	// Attach budget constraint
+	mw.WriteField("max_price", fmt.Sprintf("%f", maxPrice))
 
-	privHex := os.Getenv("MESH_PRIV_KEY")
-	if privHex == "" {
-		fmt.Println("[SECURITY] Missing MESH_PRIV_KEY. Cannot sign payload.")
-		return
-	}
-	privKey, _ := hex.DecodeString(privHex)
+	mw.Close()
 
-	signData := make([]byte, 16)
-	binary.BigEndian.PutUint64(signData[0:8], taskId)
-	binary.BigEndian.PutUint32(signData[8:12], uint32(len(wasmBytes)))
-	binary.BigEndian.PutUint32(signData[12:16], uint32(len(paramBytes)))
-
-	signature := ed25519.Sign(ed25519.PrivateKey(privKey), signData)
-
-	header := make([]byte, 84)
-	copy(header[:4], "MZ03")
-	binary.BigEndian.PutUint64(header[4:12], taskId)
-	binary.BigEndian.PutUint32(header[12:16], uint32(len(wasmBytes)))
-	binary.BigEndian.PutUint32(header[16:20], uint32(len(paramBytes)))
-	copy(header[20:84], signature)
-
-	s.Write(header)
-	s.Write(wasmBytes)
-	s.Write(paramBytes)
-
-	fmt.Println(" -> Payload sent! Waiting for execution results...")
-	io.Copy(os.Stdout, s)
-
-	n.done <- true
-}
-
-func RunSender(wasmPath, inputPath string) {
-	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"))
+	brokerURL := fmt.Sprintf("http://%s/api/tasks/submit", brokerAddr)
+	req, err := http.NewRequest("POST", brokerURL, bodyBuf)
 	if err != nil {
-		fmt.Printf("Fatal host error: %v\n", err)
+		fmt.Printf("FATAL: Failed to build request: %v\n", err)
 		return
 	}
-	defer h.Close()
+	req.Header.Set("Content-Type", mw.FormDataContentType())
 
-	ctx := context.Background()
-	done := make(chan bool)
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Printf("FATAL: Failed to connect to Broker: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
 
-	rendezvous := "mesh-zero-local-v1"
-	notifee := &senderNotifee{h: h, ctx: ctx, done: done, wasmPath: wasmPath, inputPath: inputPath}
-
-	mdnsService := mdns.NewMdnsService(h, rendezvous, notifee)
-	if err := mdnsService.Start(); err != nil {
-		fmt.Printf("Fatal mDNS error: %v\n", err)
+	if resp.StatusCode != http.StatusOK {
+		respBytes, _ := io.ReadAll(resp.Body)
+		fmt.Printf("ERROR: Task execution rejected by broker: %s\n", string(respBytes))
 		return
 	}
 
-	fmt.Println("Scanning local network for Mesh-Zero workers...")
-	<-done
-	fmt.Println("Task complete. Shutting down sender.")
+	responseBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Printf("ERROR: Failed to read response: %v\n", err)
+		return
+	}
+
+	separator := []byte("\n---MZ-RECEIPT---\n")
+	sepIdx := bytes.Index(responseBytes, separator)
+
+	var taskStdout []byte
+	var receiptJSON []byte
+
+	if sepIdx != -1 {
+		taskStdout = responseBytes[:sepIdx]
+		receiptJSON = responseBytes[sepIdx+len(separator):]
+	} else {
+		taskStdout = responseBytes
+	}
+
+	// Print the task output
+	fmt.Println(" -> Task output received:")
+	os.Stdout.Write(taskStdout)
+
+	if len(receiptJSON) > 0 {
+		var receipt ComputeReceipt
+		// Strip trailing newlines/whitespace
+		receiptJSON = bytes.TrimSpace(receiptJSON)
+		if err := json.Unmarshal(receiptJSON, &receipt); err == nil {
+			fmt.Println("\n\n========================================")
+			fmt.Println(" COMPUTE RECEIPT RECEIVED & VERIFIED")
+			fmt.Printf("  Task ID:         %d\n", receipt.TaskID)
+			fmt.Printf("  Worker Peer ID:  %s\n", receipt.WorkerID)
+			fmt.Printf("  Execution Time:  %.2f ms\n", receipt.ExecutionTimeMs)
+			fmt.Printf("  Rate:            %.4f credits/ms\n", receipt.PricePerMs)
+			fmt.Printf("  Cost Charged:    %.6f credits\n", receipt.TotalPrice)
+			fmt.Printf("  Signature:       %s...\n", receipt.Signature[:16])
+			fmt.Println("========================================")
+
+			// Process billing locally (simulated)
+			ledger, err := LoadLedger()
+			if err == nil {
+				// Deduct from sender, add to worker
+				senderID := "local-client"
+				if ledger.Balances[senderID] == 0 {
+					ledger.Balances[senderID] = 100.0 // Default starting balance
+				}
+				ledger.Balances[senderID] -= receipt.TotalPrice
+				ledger.Balances[receipt.WorkerID] += receipt.TotalPrice
+				ledger.Save()
+				fmt.Printf("[BILLING] Local account balance updated. Current: %.6f credits\n", ledger.Balances[senderID])
+			}
+		} else {
+			fmt.Printf("\n[BILLING] Received invalid receipt JSON: %v\n", err)
+		}
+	}
 }

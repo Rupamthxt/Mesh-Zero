@@ -1,19 +1,14 @@
 package core
 
 import (
-	"context"
-	"crypto/ed25519"
+	"bytes"
 	_ "embed"
-	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"os"
-	"time"
-
-	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 //go:embed dashboard.html
@@ -44,21 +39,35 @@ func (w *Worker) handleGetPeers(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	peerList := w.Host.Network().Peers()
+	brokerAddr := os.Getenv("MESH_BROKER_ADDR")
+	if brokerAddr == "" {
+		brokerAddr = "localhost:8080"
+	}
 
-	targetRendezvous := "mesh-zero-local-v1"
+	resp, err := http.Get(fmt.Sprintf("http://%s/api/workers", brokerAddr))
+	if err != nil {
+		http.Error(res, "Failed to contact broker server", http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	var workers []map[string]interface{}
+	if err := json.Unmarshal(body, &workers); err != nil {
+		http.Error(res, "Invalid broker response", http.StatusInternalServerError)
+		return
+	}
 
 	var peerIDs []string
-	for _, p := range peerList {
-		val, err := w.Host.Peerstore().Get(p, "rendezvous")
-		if err == nil && val == targetRendezvous {
-			peerIDs = append(peerIDs, p.String())
+	for _, wk := range workers {
+		if id, ok := wk["id"].(string); ok && id != w.ID {
+			peerIDs = append(peerIDs, id)
 		}
 	}
 
 	res.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(res).Encode(map[string]interface{}{
-		"node_id": w.Host.ID().String(),
+		"node_id": w.ID,
 		"peers":   peerIDs,
 		"count":   len(peerIDs),
 	})
@@ -72,13 +81,39 @@ func (w *Worker) handleExecuteTask(res http.ResponseWriter, req *http.Request) {
 
 	req.ParseMultipartForm(10 << 20)
 
-	wasmFile, _, err := req.FormFile("wasm")
-	if err != nil {
-		http.Error(res, "Missing 'wasm' file", http.StatusBadRequest)
-		return
+	var wasmBytes []byte
+	templateID := req.FormValue("template_id")
+	if templateID != "" {
+		var wasmPath string
+		if templateID == "hasher" {
+			wasmPath = "cmd/mesh-zero/hasher.wasm"
+		} else if templateID == "gpu_task" {
+			wasmPath = "task/gpu_task.wasm"
+		} else {
+			http.Error(res, "Unknown template ID", http.StatusBadRequest)
+			return
+		}
+		var err error
+		wasmBytes, err = os.ReadFile(wasmPath)
+		if err != nil {
+			wasmBytes, err = os.ReadFile("../" + wasmPath)
+			if err != nil {
+				wasmBytes, err = os.ReadFile("../../" + wasmPath)
+				if err != nil {
+					http.Error(res, fmt.Sprintf("Template file not found: %v", err), http.StatusInternalServerError)
+					return
+				}
+			}
+		}
+	} else {
+		wasmFile, _, err := req.FormFile("wasm")
+		if err != nil {
+			http.Error(res, "Missing 'wasm' file", http.StatusBadRequest)
+			return
+		}
+		defer wasmFile.Close()
+		wasmBytes, _ = io.ReadAll(wasmFile)
 	}
-	defer wasmFile.Close()
-	wasmBytes, _ := io.ReadAll(wasmFile)
 
 	dataFile, _, err := req.FormFile("data")
 	if err != nil {
@@ -88,67 +123,46 @@ func (w *Worker) handleExecuteTask(res http.ResponseWriter, req *http.Request) {
 	defer dataFile.Close()
 	dataBytes, _ := io.ReadAll(dataFile)
 
-	targetPeerID := req.FormValue("peer_id")
-	if targetPeerID == "" {
-		http.Error(res, "Missing target 'peer_id'", http.StatusBadRequest)
-		return
+	brokerAddr := os.Getenv("MESH_BROKER_ADDR")
+	if brokerAddr == "" {
+		brokerAddr = "localhost:8080"
 	}
 
-	peers := w.Host.Network().Peers()
-	var selectedPeer *peer.ID
-	for _, p := range peers {
-		if p.String() == targetPeerID {
-			selectedPeer = &p
-			break
-		}
+	bodyBuf := &bytes.Buffer{}
+	mw := multipart.NewWriter(bodyBuf)
+
+	// Add data field
+	dataPart, _ := mw.CreateFormFile("data", "data.txt")
+	dataPart.Write(dataBytes)
+
+	// Add wasm or template ID
+	if templateID != "" {
+		mw.WriteField("template_id", templateID)
+	} else {
+		wasmPart, _ := mw.CreateFormFile("wasm", "task.wasm")
+		wasmPart.Write(wasmBytes)
 	}
 
-	if selectedPeer == nil {
-		http.Error(res, "Target peer not connected", http.StatusNotFound)
-		return
-	}
+	mw.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	s, err := w.Host.NewStream(ctx, *selectedPeer, "/mesh-zero/task/1.0.0")
+	brokerURL := fmt.Sprintf("http://%s/api/tasks/submit", brokerAddr)
+	brokerReq, err := http.NewRequest("POST", brokerURL, bodyBuf)
 	if err != nil {
-		http.Error(res, "Failed to open mesh stream", http.StatusInternalServerError)
+		http.Error(res, "Failed to build broker request", http.StatusInternalServerError)
 		return
 	}
-	defer s.Close()
+	brokerReq.Header.Set("Content-Type", mw.FormDataContentType())
 
-	taskId := uint64(time.Now().UnixNano())
-
-	privHex := os.Getenv("MESH_PRIV_KEY")
-	if privHex == "" {
-		fmt.Println("[SECURITY] Missing MESH_PRIV_KEY. Cannot sign payload.")
+	client := &http.Client{}
+	brokerResp, err := client.Do(brokerReq)
+	if err != nil {
+		http.Error(res, "Broker connection error", http.StatusInternalServerError)
 		return
 	}
-	privKey, _ := hex.DecodeString(privHex)
+	defer brokerResp.Body.Close()
 
-	signData := make([]byte, 16)
-	binary.BigEndian.PutUint64(signData[0:8], taskId)
-	binary.BigEndian.PutUint32(signData[8:12], uint32(len(wasmBytes)))
-	binary.BigEndian.PutUint32(signData[12:16], uint32(len(dataBytes)))
-
-	signature := ed25519.Sign(ed25519.PrivateKey(privKey), signData)
-
-	header := make([]byte, 84)
-	copy(header[:4], "MZ03")
-	binary.BigEndian.PutUint64(header[4:12], taskId)
-	binary.BigEndian.PutUint32(header[12:16], uint32(len(wasmBytes)))
-	binary.BigEndian.PutUint32(header[16:20], uint32(len(dataBytes)))
-	copy(header[20:84], signature)
-
-	s.Write(header)
-	s.Write(wasmBytes)
-	s.Write(dataBytes)
-
-	resultBytes, _ := io.ReadAll(s)
-
-	res.Header().Set("Content-Type", "text/plain")
-	res.Write(resultBytes)
+	res.WriteHeader(brokerResp.StatusCode)
+	io.Copy(res, brokerResp.Body)
 }
 
 func corsMiddleware(next http.Handler) http.Handler {

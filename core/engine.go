@@ -11,7 +11,8 @@ import (
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
 
-func executeWasm(ctx context.Context, wasmBytes []byte, paramBytes []byte, hooks []ExtensionHook, out io.Writer) {
+func executeWasm(ctx context.Context, wasmBytes []byte, paramBytes []byte, hooks []ExtensionHook, out io.Writer) (time.Duration, error) {
+	startTime := time.Now()
 	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
@@ -24,14 +25,14 @@ func executeWasm(ctx context.Context, wasmBytes []byte, paramBytes []byte, hooks
 	for _, hook := range hooks {
 		if err := hook(ctx, r); err != nil {
 			fmt.Fprintf(out, "Failed to load extension hook: %v\n", err)
-			return
+			return time.Since(startTime), err
 		}
 	}
 
 	compiledMod, err := r.CompileModule(timeoutCtx, wasmBytes)
 	if err != nil {
 		fmt.Fprintf(out, "Compilation error: %v\n", err)
-		return
+		return time.Since(startTime), err
 	}
 
 	mod, err := r.InstantiateModule(timeoutCtx, compiledMod, wazero.NewModuleConfig().
@@ -45,7 +46,8 @@ func executeWasm(ctx context.Context, wasmBytes []byte, paramBytes []byte, hooks
 		} else {
 			fmt.Fprintf(out, "Execution failed: %v\n", err)
 		}
-		return
+		return time.Since(startTime), err
 	}
 	mod.Close(timeoutCtx)
+	return time.Since(startTime), nil
 }

@@ -1,25 +1,16 @@
 package core
 
 import (
+	"bytes"
 	"context"
-	"crypto/ed25519"
-	"encoding/binary"
-	"encoding/hex"
+	"encoding/json"
 	"fmt"
-	"io"
+	"net/url"
 	"os"
-	"sync"
+	"strconv"
 	"time"
 
-	"github.com/libp2p/go-libp2p"
-	dht "github.com/libp2p/go-libp2p-kad-dht"
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/routing"
-	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
-	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
-	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	"github.com/gorilla/websocket"
 	"github.com/tetratelabs/wazero"
 )
 
@@ -28,8 +19,9 @@ type ExtensionHook func(context.Context, wazero.Runtime) error
 var DefaultHooks []ExtensionHook
 
 type Worker struct {
-	Host  host.Host
-	Hooks []ExtensionHook
+	ID         string
+	PricePerMs float64
+	Hooks      []ExtensionHook
 }
 
 type NodeCapabilities struct {
@@ -46,178 +38,111 @@ var currentNodeCapabilities = NodeCapabilities{
 	SupportsWASI: true,
 }
 
-type workerMdnsNotifee struct {
-	h host.Host
-}
 
-func (n *workerMdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
-	// No-op: The sender will initiate connection. Worker just needs to advertise itself.
-}
-
-var completedTasks = make(map[uint64]bool)
-var taskMu sync.Mutex
 
 func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) error {
-
-	var relays []peer.AddrInfo
-	for _, peerAddr := range dht.DefaultBootstrapPeers {
-		peerInfo, err := peer.AddrInfoFromP2pAddr(peerAddr)
-		if err == nil {
-			relays = append(relays, *peerInfo)
-		}
-	}
-
-	var kdht *dht.IpfsDHT
-	h, err := libp2p.New(
-		libp2p.ListenAddrStrings(
-			"/ip4/0.0.0.0/tcp/0",
-		),
-		libp2p.NATPortMap(),
-		libp2p.EnableAutoRelayWithStaticRelays(relays),
-		libp2p.Routing(func(n host.Host) (routing.PeerRouting, error) {
-			var dhtErr error
-			kdht, dhtErr = dht.New(ctx, n, dht.Mode(dht.ModeAuto))
-			return kdht, dhtErr
-		}),
-	)
-	if err != nil {
-		fmt.Printf("Fatal host error: %v\n", err)
-		return nil
-	}
-	defer h.Close()
-	w.Host = h
+	w.ID = "worker-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 
 	fmt.Println("========================================")
-	fmt.Println(" MESH-ZERO NODE INITIALIZED")
-	fmt.Printf("  Node ID: %s\n", w.Host.ID().String())
+	fmt.Println(" MESH-ZERO LIGHTWEIGHT WORKER INITIALIZED")
+	fmt.Printf("  Worker ID: %s\n", w.ID)
 	fmt.Printf("  GPU Accel: %v | Max RAM: %d MB\n", currentNodeCapabilities.HasGPU, currentNodeCapabilities.MaxRAm)
+	fmt.Printf("  Pricing:   %.4f credits/ms\n", w.PricePerMs)
 	fmt.Println("========================================")
 
-	fmt.Println("Connecting to public bootstrap nodes....")
-	var wg sync.WaitGroup
-	for _, peerAddr := range dht.DefaultBootstrapPeers {
-		peerInfo, _ := peer.AddrInfoFromP2pAddr(peerAddr)
-		wg.Add(1)
-		go func(pi peer.AddrInfo) {
-			defer wg.Done()
-			if err := h.Connect(ctx, pi); err == nil {
-				fmt.Printf("[DHT] Connected to bootstrap node: %s\n", pi.ID.String()[:10])
-			}
-		}(*peerInfo)
+	brokerAddr := os.Getenv("MESH_BROKER_ADDR")
+	if brokerAddr == "" {
+		brokerAddr = "localhost:8080" // default fallback
 	}
-	wg.Wait()
 
-	if err = kdht.Bootstrap(ctx); err != nil {
-		fmt.Printf("Fatal DHT bootstrap error: %v\n", err)
-		return nil
-	}
-	fmt.Println("[NETWORK] Global DHT Bootstrapped successfully!")
+	u := url.URL{Scheme: "ws", Host: brokerAddr, Path: "/ws/worker"}
+	fmt.Printf("[WORKER] Connecting to Broker Gateway at %s...\n", u.String())
 
-	rendezvous := "mesh-zero-local-v1"
-	fmt.Printf("[DHT] Announcing presence to namespace: %s\n", rendezvous)
-
-	routingDiscovery := drouting.NewRoutingDiscovery(kdht)
-	dutil.Advertise(ctx, routingDiscovery, rendezvous)
-
+	// Establish connection loop with retry backoff
 	go func() {
 		for {
-			peerChan, err := routingDiscovery.FindPeers(ctx, rendezvous)
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 			if err != nil {
-				time.Sleep(time.Second * 10)
+				fmt.Printf("[WORKER] Connection failed: %v. Retrying in 5 seconds...\n", err)
+				time.Sleep(5 * time.Second)
 				continue
 			}
 
-			for pi := range peerChan {
-				if pi.ID == h.ID() || len(pi.Addrs) == 0 {
+			// 1. Register with broker
+			reg := map[string]interface{}{
+				"id":           w.ID,
+				"price_per_ms": w.PricePerMs,
+			}
+			regBytes, _ := json.Marshal(reg)
+			_ = conn.WriteMessage(websocket.TextMessage, regBytes)
+
+			fmt.Println("[WORKER] Successfully connected and registered with Central Broker!")
+
+			// 2. Loop and read tasks
+			for {
+				_, message, err := conn.ReadMessage()
+				if err != nil {
+					fmt.Printf("[WORKER] Broker connection lost: %v\n", err)
+					break
+				}
+
+				var dispatch TaskDispatch
+				if err := json.Unmarshal(message, &dispatch); err != nil {
 					continue
 				}
-				if h.Network().Connectedness(pi.ID) != network.Connected {
-					// The Tie-Breaker: Prevent simultaneous open collisions
-					if h.ID().String() < pi.ID.String() {
-						err := h.Connect(ctx, pi)
-						if err == nil {
-							fmt.Printf("[DHT] Discovered Mesh-Zero node: %s\n", pi.ID.String()[:10])
-							h.Peerstore().Put(pi.ID, "rendezvous", rendezvous)
-						}
-					}
+
+				fmt.Printf("[WORKER] Executing Task %d via Broker...\n", dispatch.TaskID)
+				
+				// Execute WASM sandbox in memory
+				var outBuf bytes.Buffer
+				duration, execErr := executeWasm(ctx, dispatch.WasmBytes, dispatch.DataBytes, w.Hooks, &outBuf)
+
+				var errStr string
+				if execErr != nil {
+					errStr = execErr.Error()
 				}
+
+				// Generate receipt
+				privKeyHex := os.Getenv("MESH_PRIV_KEY")
+				if privKeyHex == "" {
+					privKeyHex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+				}
+
+				execTimeMs := float64(duration.Nanoseconds()) / 1e6
+				var receiptJSON []byte
+				receipt, err := GenerateReceipt(dispatch.TaskID, w.ID, execTimeMs, w.PricePerMs, privKeyHex)
+				if err == nil {
+					receiptJSON, _ = json.Marshal(receipt)
+				}
+
+				// Send result back to Broker
+				resp := TaskResponse{
+					TaskID:      dispatch.TaskID,
+					Stdout:      outBuf.Bytes(),
+					ReceiptJSON: receiptJSON,
+					Error:       errStr,
+				}
+
+				respMsg, _ := json.Marshal(resp)
+				_ = conn.WriteMessage(websocket.TextMessage, respMsg)
+				fmt.Printf("[WORKER] Finished Task %d. Duration: %.2fms | Cost: %.6f credits\n", dispatch.TaskID, execTimeMs, receipt.TotalPrice)
 			}
-			time.Sleep(time.Second * 30)
+
+			time.Sleep(2 * time.Second)
 		}
 	}()
 
-	h.SetStreamHandler("/mesh-zero/task/1.0.0", func(s network.Stream) {
-		w.handleTaskStream(ctx, s)
-	})
-
-	mdnsNotifee := &workerMdnsNotifee{h: h}
-	mdnsService := mdns.NewMdnsService(h, rendezvous, mdnsNotifee)
-	if err := mdnsService.Start(); err != nil {
-		fmt.Printf("[mDNS] Error starting service: %v\n", err)
-	} else {
-		fmt.Println("[mDNS] Local service started, advertising node...")
-	}
-
+	// Start local API server/dashboard if enabled
 	if enableApi {
-		if apiPort == "" {
-			apiPort = "8080" // Fallback default
-		}
 		go w.StartAPIServer(apiPort)
 	}
 
-	fmt.Printf("Worker Node %s listening. Waiting for tasks...\n", h.ID())
-	select {}
-}
-
-func (w *Worker) handleTaskStream(ctx context.Context, s network.Stream) {
-	defer s.Close()
-
-	header := make([]byte, 84)
-	if _, err := io.ReadFull(s, header); err != nil {
-		return
-	}
-	if string(header[:4]) != "MZ03" {
-		fmt.Println("[SECURITY] Dropped connection: Invalid protocol magic.")
-		return
-	}
-
-	taskID := binary.BigEndian.Uint64(header[4:12])
-	wasmLen := binary.BigEndian.Uint32(header[12:16])
-	paramLen := binary.BigEndian.Uint32(header[16:20])
-	signature := header[20:84]
-
-	pubHex := os.Getenv("MESH_PUB_KEY")
-	if pubHex == "" {
-		fmt.Println("[SECURITY] Worker is missing MESH_PUB_KEY. Dropping task.")
-		return
-	}
-	pubKey, _ := hex.DecodeString(pubHex)
-
-	verifyData := make([]byte, 16)
-	binary.BigEndian.PutUint64(verifyData[0:8], taskID)
-	binary.BigEndian.PutUint32(verifyData[8:12], wasmLen)
-	binary.BigEndian.PutUint32(verifyData[12:16], paramLen)
-
-	if !ed25519.Verify(ed25519.PublicKey(pubKey), verifyData, signature) {
-		fmt.Printf("[SECURITY] INTRUSION BLOCKED! Invalid signature from peer: %s\n", s.Conn().RemotePeer())
-		return
-	}
-
-	taskMu.Lock()
-	if completedTasks[taskID] {
-		fmt.Printf("Worker already executed Task %d. Ignoring.\n", taskID)
-		taskMu.Unlock()
-		return
-	}
-	completedTasks[taskID] = true
-	taskMu.Unlock()
-
-	wasmBin := make([]byte, wasmLen)
-	io.ReadFull(s, wasmBin)
-
-	paramBin := make([]byte, paramLen)
-	io.ReadFull(s, paramBin)
-
-	fmt.Printf("\n[WORKER] Task Received! WASM: %dB, Params: %dB\n", wasmLen, paramLen)
-	executeWasm(ctx, wasmBin, paramBin, w.Hooks, s)
+	<-ctx.Done()
+	return nil
 }

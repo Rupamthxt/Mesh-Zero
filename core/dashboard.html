@@ -4,58 +4,431 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Mesh-Zero Control Plane</title>
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;700;800&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
     <style>
-        body { font-family: ui-sans-serif, system-ui, sans-serif; background: #0f172a; color: #f8fafc; padding: 2rem; max-width: 800px; margin: 0 auto; }
-        .card { background: #1e293b; padding: 1.5rem; border-radius: 8px; border: 1px solid #334155; margin-bottom: 1.5rem; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
-        h1 { color: #38bdf8; margin-top: 0; }
-        h2 { font-size: 1.25rem; margin-top: 0; color: #cbd5e1; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; }
-        label { display: block; margin-bottom: 0.5rem; font-size: 0.875rem; color: #94a3b8; }
-        select, input[type="file"] { width: 100%; padding: 0.5rem; background: #0f172a; border: 1px solid #334155; color: white; border-radius: 4px; margin-bottom: 1rem; }
-        button { background: #0284c7; color: white; border: none; padding: 0.5rem 1rem; border-radius: 4px; cursor: pointer; font-weight: bold; width: 100%; transition: background 0.2s; }
-        button:hover { background: #0369a1; }
-        pre { background: #020617; padding: 1rem; border-radius: 4px; overflow-x: auto; font-size: 0.875rem; color: #a7f3d0; border: 1px solid #1e293b; }
+        :root {
+            --bg-color: #030712;
+            --card-bg: rgba(17, 24, 39, 0.7);
+            --border-color: rgba(55, 65, 81, 0.5);
+            --primary: #06b6d4;
+            --primary-hover: #0891b2;
+            --accent: #6366f1;
+            --success: #10b981;
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+        }
+
+        * { box-sizing: border-box; transition: all 0.2s ease-in-out; }
+        
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-color);
+            background-image: 
+                radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.15) 0px, transparent 50%),
+                radial-gradient(at 100% 100%, rgba(6, 182, 212, 0.15) 0px, transparent 50%);
+            color: var(--text-main);
+            padding: 2.5rem;
+            max-width: 1200px;
+            margin: 0 auto;
+            min-height: 100vh;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2.5rem;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 1.5rem;
+        }
+
+        h1 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 2.25rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, #06b6d4 0%, #6366f1 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin: 0;
+            letter-spacing: -0.025em;
+        }
+
+        .status-badge {
+            background: rgba(16, 185, 129, 0.1);
+            border: 1px solid rgba(16, 185, 129, 0.2);
+            color: var(--success);
+            padding: 0.5rem 1rem;
+            border-radius: 9999px;
+            font-size: 0.875rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            background-color: var(--success);
+            border-radius: 50%;
+            box-shadow: 0 0 10px var(--success);
+        }
+
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2.5rem;
+        }
+
+        .stat-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 1.5rem;
+            backdrop-filter: blur(12px);
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.4);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; width: 4px; height: 100%;
+            background: linear-gradient(to bottom, var(--primary), var(--accent));
+        }
+
+        .stat-title {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            margin-bottom: 0.5rem;
+            font-weight: 700;
+        }
+
+        .stat-value {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: #ffffff;
+            cursor: pointer;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .stat-value:hover {
+            color: var(--primary);
+        }
+
+        /* Main Workspace Layout */
+        .workspace {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+        }
+
+        @media (max-width: 900px) {
+            .workspace { grid-template-columns: 1fr; }
+        }
+
+        .panel {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            padding: 2rem;
+            backdrop-filter: blur(12px);
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+        }
+
+        h2 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.25rem;
+            font-weight: 600;
+            margin-top: 0;
+            margin-bottom: 1.5rem;
+            color: #ffffff;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-size: 0.875rem;
+            color: var(--text-muted);
+            font-weight: 500;
+        }
+
+        select, input[type="file"] {
+            width: 100%;
+            padding: 0.75rem 1rem;
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid var(--border-color);
+            color: #ffffff;
+            border-radius: 10px;
+            margin-bottom: 1.5rem;
+            font-size: 0.95rem;
+        }
+
+        select:focus, input[type="file"]:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 2px rgba(6, 182, 212, 0.2);
+        }
+
+        /* Customize File Input Styling */
+        input[type="file"]::file-selector-button {
+            background: rgba(99, 102, 241, 0.2);
+            border: 1px solid rgba(99, 102, 241, 0.4);
+            color: #e0e7ff;
+            padding: 0.4rem 0.8rem;
+            border-radius: 6px;
+            margin-right: 1rem;
+            cursor: pointer;
+        }
+        input[type="file"]::file-selector-button:hover {
+            background: rgba(99, 102, 241, 0.3);
+        }
+
+        button.btn-primary {
+            background: linear-gradient(135deg, var(--primary) 0%, var(--accent) 100%);
+            color: white;
+            border: none;
+            padding: 0.875rem 1.5rem;
+            border-radius: 10px;
+            cursor: pointer;
+            font-weight: 600;
+            width: 100%;
+            font-size: 1rem;
+            box-shadow: 0 4px 14px rgba(99, 102, 241, 0.4);
+        }
+
+        button.btn-primary:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(99, 102, 241, 0.6);
+        }
+
+        button.btn-primary:disabled {
+            background: var(--border-color);
+            box-shadow: none;
+            cursor: not-allowed;
+            opacity: 0.6;
+        }
+
+        /* Console Output styling */
+        .console-container {
+            position: relative;
+        }
+
+        pre.console {
+            background: #020617;
+            padding: 1.25rem;
+            border-radius: 12px;
+            overflow-x: auto;
+            font-family: 'Fira Code', monospace;
+            font-size: 0.875rem;
+            color: #10b981;
+            border: 1px solid rgba(16, 185, 129, 0.15);
+            max-height: 250px;
+            margin: 0;
+        }
+
+        /* Receipt Card (Glow certificate) */
+        .receipt-card {
+            margin-top: 1.5rem;
+            background: linear-gradient(135deg, rgba(6, 182, 212, 0.08) 0%, rgba(99, 102, 241, 0.08) 100%);
+            border: 1px solid rgba(6, 182, 212, 0.25);
+            border-radius: 14px;
+            padding: 1.25rem;
+            box-shadow: 0 0 20px rgba(6, 182, 212, 0.1);
+            display: none;
+        }
+
+        .receipt-header {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            color: var(--primary);
+            font-weight: 700;
+            font-size: 0.95rem;
+            margin-bottom: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .receipt-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 0.75rem;
+            font-size: 0.85rem;
+        }
+
+        .receipt-item span:first-child {
+            display: block;
+            color: var(--text-muted);
+            font-size: 0.75rem;
+            margin-bottom: 0.15rem;
+        }
+
+        .receipt-item span:last-child {
+            font-weight: 600;
+            color: #ffffff;
+        }
+
+        .toast-copy {
+            position: fixed;
+            bottom: 2rem;
+            right: 2rem;
+            background: var(--success);
+            color: white;
+            padding: 0.75rem 1.5rem;
+            border-radius: 8px;
+            font-weight: 600;
+            opacity: 0;
+            pointer-events: none;
+            transform: translateY(10px);
+            z-index: 100;
+        }
+
+        .toast-copy.show {
+            opacity: 1;
+            transform: translateY(0);
+        }
     </style>
 </head>
 <body>
 
-    <h1>🕸️ Mesh-Zero Control Plane</h1>
+    <header>
+        <h1>Mesh-Zero Control Plane</h1>
+        <div class="status-badge">
+            <span class="status-dot"></span>
+            Node Online
+        </div>
+    </header>
 
-    <div class="card">
-        <h2>Network Topology</h2>
-        <button onclick="fetchPeers()" style="width: auto; margin-bottom: 1rem;">🔄 Scan Local Mesh</button>
-        <pre id="peer-list">Initializing discovery...</pre>
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-title">Local Node ID (Click to Copy)</div>
+            <div class="stat-value" id="node-id-val" onclick="copyText(this.innerText)">Loading...</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-title">Platform Account Balance</div>
+            <div class="stat-value" id="account-balance">$98.1651 USD</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-title">Local Mesh Discovery</div>
+            <div class="stat-value" id="peers-count-val">0 Nodes</div>
+        </div>
     </div>
 
-    <div class="card">
-        <h2>Deploy Task Payload</h2>
-        <form id="deploy-form" onsubmit="deployTask(event)">
-            <label for="peer-select">Target Mesh Node</label>
-            <select id="peer-select" required>
-                <option value="">No peers found...</option>
-            </select>
+    <div class="workspace">
+        <!-- Execution Panel -->
+        <div class="panel">
+            <h2>Deploy Compute Task</h2>
+            <form id="deploy-form" onsubmit="deployTask(event)">
+                <label for="peer-select">Target Workload Node</label>
+                <select id="peer-select" required>
+                    <option value="">Searching for available peers...</option>
+                </select>
 
-            <label for="wasm-file">WASM Executable (.wasm)</label>
-            <input type="file" id="wasm-file" accept=".wasm" required>
+                <label for="task-mode">Deployment Mode</label>
+                <select id="task-mode" onchange="toggleTaskMode(this.value)" required>
+                    <option value="template">Pre-compiled App Template</option>
+                    <option value="custom">Custom WASM Upload</option>
+                </select>
 
-            <label for="data-file">Input Data (Stdin)</label>
-            <input type="file" id="data-file" required>
+                <div id="template-section">
+                    <label for="template-select">Choose App Template</label>
+                    <select id="template-select">
+                        <option value="hasher">SHA-256 Hasher App</option>
+                        <option value="gpu_task">GPU Matrix Multiplier Solver</option>
+                    </select>
+                </div>
 
-            <button type="submit" id="deploy-btn">🚀 Deploy to Edge Node</button>
-        </form>
+                <div id="custom-wasm-section" style="display: none;">
+                    <label for="wasm-file">WASM Binary (.wasm)</label>
+                    <input type="file" id="wasm-file" accept=".wasm">
+                </div>
+
+                <label for="data-file">Task Parameters (Stdin)</label>
+                <input type="file" id="data-file" required>
+
+                <button type="submit" id="deploy-btn" class="btn-primary">🚀 Blast Payload to Node</button>
+            </form>
+        </div>
+
+        <!-- Monitoring Console -->
+        <div class="panel">
+            <h2>Live Compute logs</h2>
+            <div class="console-container">
+                <pre id="result-log" class="console">Waiting for workload deployment...</pre>
+            </div>
+
+            <!-- Verified Compute Receipt certificate -->
+            <div class="receipt-card" id="receipt-card">
+                <div class="receipt-header">
+                    🛡️ Verified Proof-of-Work Receipt
+                </div>
+                <div class="receipt-grid">
+                    <div class="receipt-item">
+                        <span>Task ID</span>
+                        <span id="r-task-id">-</span>
+                    </div>
+                    <div class="receipt-item">
+                        <span>Worker node</span>
+                        <span id="r-worker-id">-</span>
+                    </div>
+                    <div class="receipt-item">
+                        <span>Execution duration</span>
+                        <span id="r-duration">-</span>
+                    </div>
+                    <div class="receipt-item">
+                        <span>Charged rate</span>
+                        <span id="r-rate">-</span>
+                    </div>
+                    <div class="receipt-item">
+                        <span>Charged total</span>
+                        <span id="r-total" style="color: var(--primary); font-weight: 700;">-</span>
+                    </div>
+                    <div class="receipt-item">
+                        <span>Receipt signature</span>
+                        <span id="r-sig" style="font-family: monospace; font-size: 0.75rem;">-</span>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
-    <div class="card">
-        <h2>Execution Stream</h2>
-        <pre id="result-log">Waiting for workload...</pre>
-    </div>
+    <div class="toast-copy" id="toast">Copied to clipboard!</div>
 
     <script>
+        // Track mock credits
+        let currentBalance = 98.165198;
+
+        function copyText(text) {
+            navigator.clipboard.writeText(text);
+            const toast = document.getElementById('toast');
+            toast.classList.add('show');
+            setTimeout(() => {
+                toast.classList.remove('show');
+            }, 2000);
+        }
+
         async function fetchPeers() {
             try {
                 const res = await fetch('/api/peers');
                 const data = await res.json();
                 
-                document.getElementById('peer-list').innerText = JSON.stringify(data, null, 2);
+                document.getElementById('node-id-val').innerText = data.node_id;
+                document.getElementById('peers-count-val').innerText = `${data.count} Node(s)`;
                 
                 const select = document.getElementById('peer-select');
                 select.innerHTML = '';
@@ -64,14 +437,31 @@
                     data.peers.forEach(p => {
                         const opt = document.createElement('option');
                         opt.value = p;
-                        opt.innerText = p;
+                        opt.innerText = p.substring(0, 16) + '...';
                         select.appendChild(opt);
                     });
                 } else {
-                    select.innerHTML = '<option value="">Waiting for peers...</option>';
+                    select.innerHTML = '<option value="">Searching for mesh nodes...</option>';
                 }
             } catch (err) {
-                document.getElementById('peer-list').innerText = "Error connecting to local gateway.";
+                document.getElementById('node-id-val').innerText = "Disconnected";
+                document.getElementById('peers-count-val').innerText = "0 Nodes";
+            }
+        }
+
+        function toggleTaskMode(mode) {
+            const templateSec = document.getElementById('template-section');
+            const customWasmSec = document.getElementById('custom-wasm-section');
+            const wasmFile = document.getElementById('wasm-file');
+            
+            if (mode === 'template') {
+                templateSec.style.display = 'block';
+                customWasmSec.style.display = 'none';
+                wasmFile.required = false;
+            } else {
+                templateSec.style.display = 'none';
+                customWasmSec.style.display = 'block';
+                wasmFile.required = true;
             }
         }
 
@@ -79,15 +469,24 @@
             e.preventDefault();
             const log = document.getElementById('result-log');
             const btn = document.getElementById('deploy-btn');
+            const receiptCard = document.getElementById('receipt-card');
             
+            // Reset state
+            receiptCard.style.display = 'none';
             btn.innerText = "⏳ Transmitting Payload...";
             btn.disabled = true;
-            log.innerText = "[Gateway] Negotiating MZ03 protocol with mesh...\n";
+            log.innerText = "[Gateway] Negotiating quote with peer...\n";
 
             const formData = new FormData();
             formData.append('peer_id', document.getElementById('peer-select').value);
-            formData.append('wasm', document.getElementById('wasm-file').files[0]);
             formData.append('data', document.getElementById('data-file').files[0]);
+
+            const mode = document.getElementById('task-mode').value;
+            if (mode === 'template') {
+                formData.append('template_id', document.getElementById('template-select').value);
+            } else {
+                formData.append('wasm', document.getElementById('wasm-file').files[0]);
+            }
 
             try {
                 const startTime = performance.now();
@@ -99,18 +498,46 @@
                 const text = await res.text();
                 const latency = Math.round(performance.now() - startTime);
                 
-                log.innerText += `[Gateway] Stream closed. Round-trip latency: ${latency}ms\n\n`;
-                log.innerText += `--- WASM STDOUT ---\n${text}`;
+                log.innerText += `[Gateway] Stream closed. Latency: ${latency}ms\n\n`;
+
+                // Split receipt trailer if present
+                const separator = "\n---MZ-RECEIPT---\n";
+                const parts = text.split(separator);
+                
+                log.innerText += `--- WASM STDOUT ---\n${parts[0]}`;
+
+                if (parts.length > 1) {
+                    try {
+                        const receipt = JSON.parse(parts[1].trim());
+                        
+                        // Populate receipt certificate UI
+                        document.getElementById('r-task-id').innerText = receipt.task_id;
+                        document.getElementById('r-worker-id').innerText = receipt.worker_id.substring(0, 16) + '...';
+                        document.getElementById('r-duration').innerText = `${receipt.execution_time_ms.toFixed(2)} ms`;
+                        document.getElementById('r-rate').innerText = `${receipt.price_per_ms.toFixed(4)} credits/ms`;
+                        document.getElementById('r-total').innerText = `${receipt.total_price.toFixed(6)} credits`;
+                        document.getElementById('r-sig').innerText = receipt.signature.substring(0, 12) + '...';
+                        
+                        receiptCard.style.display = 'block';
+
+                        // Deduct balance and update view
+                        currentBalance -= receipt.total_price;
+                        document.getElementById('account-balance').innerText = `$${currentBalance.toFixed(4)} USD`;
+                    } catch (pErr) {
+                        console.error("Failed to parse billing receipt:", pErr);
+                    }
+                }
             } catch (err) {
                 log.innerText += `\n[Fatal] Mesh transmission failed: ${err}`;
             } finally {
-                btn.innerText = "🚀 Deploy to Edge Node";
+                btn.innerText = "🚀 Blast Payload to Node";
                 btn.disabled = false;
             }
         }
 
-        // Auto-fetch peers on load
+        // Auto-fetch peers on load and start periodic scan
         fetchPeers();
+        setInterval(fetchPeers, 5000);
     </script>
 </body>
 </html>
