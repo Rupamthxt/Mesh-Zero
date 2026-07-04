@@ -15,6 +15,7 @@ import (
 type WorkerConnection struct {
 	ID         string  `json:"id"`
 	PricePerMs float64 `json:"price_per_ms"`
+	Tier       int     `json:"tier"`
 	Conn       *websocket.Conn
 	Busy       bool
 }
@@ -40,6 +41,7 @@ func NewBroker() *Broker {
 type RegisterPayload struct {
 	ID         string  `json:"id"`
 	PricePerMs float64 `json:"price_per_ms"`
+	Tier       int     `json:"tier"`
 }
 
 type TaskDispatch struct {
@@ -85,6 +87,7 @@ func (b *Broker) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 	worker := &WorkerConnection{
 		ID:         reg.ID,
 		PricePerMs: reg.PricePerMs,
+		Tier:       reg.Tier,
 		Conn:       conn,
 		Busy:       false,
 	}
@@ -93,7 +96,7 @@ func (b *Broker) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 	b.workers[reg.ID] = worker
 	b.workersMu.Unlock()
 
-	fmt.Printf("[BROKER] Worker %s registered (Price: %.4f credits/ms)\n", reg.ID[:8], reg.PricePerMs)
+	fmt.Printf("[BROKER] Worker %s registered (Tier: %d | Price: %.4f credits/ms)\n", reg.ID[:8], reg.Tier, reg.PricePerMs)
 
 	// Keep connection alive & route replies
 	defer func() {
@@ -177,8 +180,13 @@ func (b *Broker) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 	// 1. Find an idle worker
 	b.workersMu.Lock()
 	var targetWorker *WorkerConnection
+	targetTier := 0 // 0 means any tier
+	if tierStr := r.FormValue("tier"); tierStr != "" {
+		fmt.Sscanf(tierStr, "%d", &targetTier)
+	}
+
 	for _, worker := range b.workers {
-		if !worker.Busy && (maxPrice == 0 || worker.PricePerMs <= maxPrice) {
+		if !worker.Busy && (targetTier == 0 || worker.Tier == targetTier) && (maxPrice == 0 || worker.PricePerMs <= maxPrice) {
 			targetWorker = worker
 			worker.Busy = true
 			break

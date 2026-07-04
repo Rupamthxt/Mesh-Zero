@@ -3,6 +3,8 @@ package core
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -19,9 +21,10 @@ type ExtensionHook func(context.Context, wazero.Runtime) error
 var DefaultHooks []ExtensionHook
 
 type Worker struct {
-	ID         string
-	PricePerMs float64
-	Hooks      []ExtensionHook
+	ID            string
+	PricePerMs    float64
+	PrivateKeyHex string
+	Hooks         []ExtensionHook
 }
 
 type NodeCapabilities struct {
@@ -41,6 +44,12 @@ var currentNodeCapabilities = NodeCapabilities{
 
 
 func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) error {
+	privKeyHex, err := ensureLocalKeyPair()
+	if err != nil {
+		return fmt.Errorf("failed to load/generate worker key: %v", err)
+	}
+	w.PrivateKeyHex = privKeyHex
+
 	w.ID = "worker-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 
 	fmt.Println("========================================")
@@ -74,10 +83,19 @@ func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) erro
 				continue
 			}
 
+			// Determine hardware tier: 1 = GPU/High-end, 2 = Desktop (Standard), 3 = Mobile/IoT
+			tier := 2
+			if currentNodeCapabilities.HasGPU {
+				tier = 1
+			} else if currentNodeCapabilities.IsMobile {
+				tier = 3
+			}
+
 			// 1. Register with broker
 			reg := map[string]interface{}{
 				"id":           w.ID,
 				"price_per_ms": w.PricePerMs,
+				"tier":         tier,
 			}
 			regBytes, _ := json.Marshal(reg)
 			_ = conn.WriteMessage(websocket.TextMessage, regBytes)
@@ -108,15 +126,10 @@ func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) erro
 					errStr = execErr.Error()
 				}
 
-				// Generate receipt
-				privKeyHex := os.Getenv("MESH_PRIV_KEY")
-				if privKeyHex == "" {
-					privKeyHex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-				}
-
+				// Generate receipt using auto-initialized worker key
 				execTimeMs := float64(duration.Nanoseconds()) / 1e6
 				var receiptJSON []byte
-				receipt, err := GenerateReceipt(dispatch.TaskID, w.ID, execTimeMs, w.PricePerMs, privKeyHex)
+				receipt, err := GenerateReceipt(dispatch.TaskID, w.ID, execTimeMs, w.PricePerMs, w.PrivateKeyHex)
 				if err == nil {
 					receiptJSON, _ = json.Marshal(receipt)
 				}
@@ -145,4 +158,33 @@ func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) erro
 
 	<-ctx.Done()
 	return nil
+}
+
+func ensureLocalKeyPair() (string, error) {
+	keyFile := "mesh_worker.key"
+
+	// Try to read existing key
+	data, err := os.ReadFile(keyFile)
+	if err == nil {
+		privKeyHex := string(bytes.TrimSpace(data))
+		if len(privKeyHex) == 128 { // 64 bytes in hex is 128 characters
+			return privKeyHex, nil
+		}
+	}
+
+	// Generate new keypair
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		return "", err
+	}
+	_ = pub
+
+	privHex := hex.EncodeToString(priv)
+	err = os.WriteFile(keyFile, []byte(privHex), 0600)
+	if err != nil {
+		return "", err
+	}
+
+	fmt.Println("[SECURITY] New worker cryptographic keypair auto-generated and saved locally.")
+	return privHex, nil
 }
