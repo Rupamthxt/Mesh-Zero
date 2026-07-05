@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/tetratelabs/wazero"
@@ -13,7 +15,15 @@ import (
 
 func executeWasm(ctx context.Context, wasmBytes []byte, paramBytes []byte, hooks []ExtensionHook, out io.Writer) (time.Duration, error) {
 	startTime := time.Now()
-	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+
+	timeoutSeconds := 5
+	if customTimeoutStr := os.Getenv("MESH_TASK_TIMEOUT"); customTimeoutStr != "" {
+		if t, err := strconv.Atoi(customTimeoutStr); err == nil && t > 0 {
+			timeoutSeconds = t
+		}
+	}
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
 	defer cancel()
 
 	config := wazero.NewRuntimeConfig().WithMemoryLimitPages(100)
@@ -42,7 +52,7 @@ func executeWasm(ctx context.Context, wasmBytes []byte, paramBytes []byte, hooks
 
 	if err != nil {
 		if timeoutCtx.Err() == context.DeadlineExceeded {
-			fmt.Fprintf(out, "[SYSTEM KILL] Task exceeded 5-second execution limit.\n")
+			fmt.Fprintf(out, "[SYSTEM KILL] Task exceeded %d-second execution limit.\n", timeoutSeconds)
 		} else {
 			fmt.Fprintf(out, "Execution failed: %v\n", err)
 		}

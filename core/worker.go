@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"strconv"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -50,7 +49,10 @@ func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) erro
 	}
 	w.PrivateKeyHex = privKeyHex
 
-	w.ID = "worker-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	privBytes, _ := hex.DecodeString(w.PrivateKeyHex)
+	privKey := ed25519.PrivateKey(privBytes)
+	pubKey := privKey.Public().(ed25519.PublicKey)
+	w.ID = hex.EncodeToString(pubKey)
 
 	fmt.Println("========================================")
 	fmt.Println(" MESH-ZERO LIGHTWEIGHT WORKER INITIALIZED")

@@ -208,6 +208,7 @@ func handleBrokerCommand() {
 
 	if subCommand == "start" {
 		broker := core.NewBroker()
+		defer core.CloseDB()
 		err := broker.Start(port)
 		if err != nil {
 			fmt.Printf("Broker server error: %v\n", err)

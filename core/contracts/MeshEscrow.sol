@@ -104,11 +104,13 @@ contract MeshEscrow {
         job.escrowedAmount = 0;
 
         // Payout to worker
-        payable(signer).transfer(payout);
+        (bool payoutSuccess, ) = payable(signer).call{value: payout}("");
+        require(payoutSuccess, "Payout transfer failed");
 
         // Refund excess back to client
         if (refund > 0) {
-            payable(job.client).transfer(refund);
+            (bool refundSuccess, ) = payable(job.client).call{value: refund}("");
+            require(refundSuccess, "Refund transfer failed");
         }
 
         emit PayoutClaimed(taskId, signer, payout, refund);

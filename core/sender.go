@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"time"
 )
 
 func RunSender(wasmPath, inputPath string, maxPrice float64) {
@@ -72,62 +73,104 @@ func RunSender(wasmPath, inputPath string, maxPrice float64) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusAccepted {
 		respBytes, _ := io.ReadAll(resp.Body)
-		fmt.Printf("ERROR: Task execution rejected by broker: %s\n", string(respBytes))
+		fmt.Printf("ERROR: Task submission rejected by broker: %s\n", string(respBytes))
 		return
 	}
 
-	responseBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Printf("ERROR: Failed to read response: %v\n", err)
+	var submitResp struct {
+		TaskID uint64 `json:"task_id"`
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&submitResp); err != nil {
+		fmt.Printf("ERROR: Failed to parse submission response: %v\n", err)
 		return
 	}
 
-	separator := []byte("\n---MZ-RECEIPT---\n")
-	sepIdx := bytes.Index(responseBytes, separator)
+	fmt.Printf("[CLIENT] Task queued. TaskID: %d. Waiting for execution...\n", submitResp.TaskID)
 
-	var taskStdout []byte
-	var receiptJSON []byte
+	// Start polling the status endpoint
+	statusURL := fmt.Sprintf("http://%s/api/tasks/status?id=%d", brokerAddr, submitResp.TaskID)
+	var taskStdout string
+	var receiptJSON string
+	var taskErr string
 
-	if sepIdx != -1 {
-		taskStdout = responseBytes[:sepIdx]
-		receiptJSON = responseBytes[sepIdx+len(separator):]
-	} else {
-		taskStdout = responseBytes
+	for {
+		time.Sleep(500 * time.Millisecond)
+
+		statusResp, err := http.Get(statusURL)
+		if err != nil {
+			fmt.Printf("ERROR: Failed to poll task status: %v\n", err)
+			return
+		}
+
+		var s struct {
+			Status      string `json:"status"`
+			Stdout      string `json:"stdout"`
+			ReceiptJSON string `json:"receipt_json"`
+			Error       string `json:"error"`
+		}
+
+		if err := json.NewDecoder(statusResp.Body).Decode(&s); err != nil {
+			statusResp.Body.Close()
+			continue
+		}
+		statusResp.Body.Close()
+
+		if s.Status == "completed" || s.Status == "failed" {
+			taskStdout = s.Stdout
+			receiptJSON = s.ReceiptJSON
+			taskErr = s.Error
+			break
+		}
+	}
+
+	if taskErr != "" {
+		fmt.Printf("ERROR: Task execution failed: %s\n", taskErr)
+		return
 	}
 
 	// Print the task output
 	fmt.Println(" -> Task output received:")
-	os.Stdout.Write(taskStdout)
+	fmt.Print(taskStdout)
 
 	if len(receiptJSON) > 0 {
 		var receipt ComputeReceipt
-		// Strip trailing newlines/whitespace
-		receiptJSON = bytes.TrimSpace(receiptJSON)
-		if err := json.Unmarshal(receiptJSON, &receipt); err == nil {
-			fmt.Println("\n\n========================================")
-			fmt.Println(" COMPUTE RECEIPT RECEIVED & VERIFIED")
-			fmt.Printf("  Task ID:         %d\n", receipt.TaskID)
-			fmt.Printf("  Worker Peer ID:  %s\n", receipt.WorkerID)
-			fmt.Printf("  Execution Time:  %.2f ms\n", receipt.ExecutionTimeMs)
-			fmt.Printf("  Rate:            %.4f credits/ms\n", receipt.PricePerMs)
-			fmt.Printf("  Cost Charged:    %.6f credits\n", receipt.TotalPrice)
-			fmt.Printf("  Signature:       %s...\n", receipt.Signature[:16])
-			fmt.Println("========================================")
+		err := json.Unmarshal([]byte(receiptJSON), &receipt)
+		if err == nil {
+			// Verify signature locally
+			isValid, verifyErr := VerifyReceipt(&receipt, receipt.WorkerID)
+			if verifyErr == nil && isValid {
+				fmt.Println("\n========================================")
+				fmt.Println(" COMPUTE RECEIPT RECEIVED & VERIFIED")
+				fmt.Printf("  Task ID:         %d\n", receipt.TaskID)
+				fmt.Printf("  Worker Peer ID:  %s\n", receipt.WorkerID)
+				fmt.Printf("  Execution Time:  %.2f ms\n", receipt.ExecutionTimeMs)
+				fmt.Printf("  Rate:            %.4f credits/ms\n", receipt.PricePerMs)
+				fmt.Printf("  Cost Charged:    %.6f credits\n", receipt.TotalPrice)
+				fmt.Printf("  Signature:       %s...\n", receipt.Signature[:16])
+				fmt.Println("========================================")
 
-			// Process billing locally (simulated)
-			ledger, err := LoadLedger()
-			if err == nil {
-				// Deduct from sender, add to worker
-				senderID := "local-client"
-				if ledger.Balances[senderID] == 0 {
-					ledger.Balances[senderID] = 100.0 // Default starting balance
+				// Process billing locally (simulated)
+				ledger, err := LoadLedger()
+				if err == nil {
+					// Deduct from sender, add to worker
+					senderID := "local-client"
+					senderBal := ledger.GetBalance(senderID)
+					if senderBal == 0 {
+						senderBal = 100.0 // Default starting balance
+					}
+					ledger.SetBalance(senderID, senderBal-receipt.TotalPrice)
+					
+					workerBal := ledger.GetBalance(receipt.WorkerID)
+					ledger.SetBalance(receipt.WorkerID, workerBal+receipt.TotalPrice)
+					
+					ledger.Save()
+					fmt.Printf("[BILLING] Local account balance updated. Current: %.6f credits\n", ledger.GetBalance(senderID))
 				}
-				ledger.Balances[senderID] -= receipt.TotalPrice
-				ledger.Balances[receipt.WorkerID] += receipt.TotalPrice
-				ledger.Save()
-				fmt.Printf("[BILLING] Local account balance updated. Current: %.6f credits\n", ledger.Balances[senderID])
+			} else {
+				fmt.Printf("\n[BILLING] Cryptographic Verification Failure: Mismatched worker signature.\n")
 			}
 		} else {
 			fmt.Printf("\n[BILLING] Received invalid receipt JSON: %v\n", err)

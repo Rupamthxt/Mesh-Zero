@@ -3,9 +3,7 @@ package core
 import (
 	"crypto/ed25519"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"os"
 )
 
 // ComputeReceipt represents a cryptographically verifiable proof of work/compute.
@@ -74,30 +72,25 @@ func VerifyReceipt(receipt *ComputeReceipt, pubKeyHex string) (bool, error) {
 	return isValid, nil
 }
 
-// SimulatedBillingLedger tracks the credit balances of different senders/workers in the local node.
-type SimulatedBillingLedger struct {
-	Balances map[string]float64 `json:"balances"`
-}
-
-const LedgerFile = "mesh_ledger.json"
+// SimulatedBillingLedger wraps SQLite queries to preserve code compatibility
+type SimulatedBillingLedger struct{}
 
 func LoadLedger() (*SimulatedBillingLedger, error) {
-	data, err := os.ReadFile(LedgerFile)
+	err := InitDB()
 	if err != nil {
-		// Return empty ledger
-		return &SimulatedBillingLedger{Balances: make(map[string]float64)}, nil
-	}
-	var ledger SimulatedBillingLedger
-	if err := json.Unmarshal(data, &ledger); err != nil {
 		return nil, err
 	}
-	return &ledger, nil
+	return &SimulatedBillingLedger{}, nil
+}
+
+func (l *SimulatedBillingLedger) GetBalance(id string) float64 {
+	return GetBalanceDB(id)
+}
+
+func (l *SimulatedBillingLedger) SetBalance(id string, amount float64) {
+	_ = SetBalanceDB(id, amount)
 }
 
 func (l *SimulatedBillingLedger) Save() error {
-	data, err := json.MarshalIndent(l, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(LedgerFile, data, 0644)
+	return nil // SQLite queries commit immediately
 }
