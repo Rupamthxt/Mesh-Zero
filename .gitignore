@@ -4,3 +4,6 @@
 *.txt
 # Added by goreleaser init:
 dist/
+*.db-shm
+*.db-wal
+mesh-zero

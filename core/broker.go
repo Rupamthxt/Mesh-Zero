@@ -229,7 +229,7 @@ func (b *Broker) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 	defer dataFile.Close()
 	dataBytes, _ := io.ReadAll(dataFile)
 
-	targetTier := 2 // Default Desktop
+	targetTier := 0 // 0 means any tier
 	if tierStr := r.FormValue("tier"); tierStr != "" {
 		fmt.Sscanf(tierStr, "%d", &targetTier)
 	}
