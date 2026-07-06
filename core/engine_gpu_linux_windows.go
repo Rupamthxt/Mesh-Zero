@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"os/exec"
 	"runtime"
 	"sync"
 	"syscall"
@@ -93,11 +94,15 @@ func detectCuda() bool {
 		fmt.Println("[GPU] NVIDIA CUDA initialized successfully via nvcuda.dll")
 		return true
 	} else if runtime.GOOS == "linux" {
-		// Check for libcuda.so in standard Linux locations
+		// Check for libcuda.so in standard Linux locations (including WSL2 and Arch/Fedora)
 		libPaths := []string{
 			"/usr/lib/x86_64-linux-gnu/libcuda.so.1",
 			"/usr/lib/x86_64-linux-gnu/libcuda.so",
 			"/usr/local/cuda/lib64/libcuda.so",
+			"/usr/lib/libcuda.so.1",
+			"/usr/lib/libcuda.so",
+			"/usr/lib/wsl/lib/libcuda.so.1",
+			"/usr/lib/wsl/lib/libcuda.so",
 		}
 		found := false
 		for _, path := range libPaths {
@@ -106,10 +111,17 @@ func detectCuda() bool {
 				break
 			}
 		}
+
+		// Fallback check: try running nvidia-smi to confirm active drivers
+		if !found {
+			cmd := exec.Command("nvidia-smi")
+			if err := cmd.Run(); err == nil {
+				found = true
+			}
+		}
+
 		if found {
-			fmt.Println("[GPU] Linux CUDA driver detected (libcuda.so).")
-			// For prototype CGO-free execution on Linux, we flag GPU capacity true
-			// In production, Ebitengine's Purego package is used to dynamically link libcuda.so
+			fmt.Println("[GPU] Linux CUDA driver detected (libcuda.so or active nvidia-smi).")
 			return true
 		}
 	}
