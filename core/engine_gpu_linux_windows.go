@@ -105,23 +105,37 @@ func detectCuda() bool {
 			"/usr/lib/wsl/lib/libcuda.so",
 		}
 		found := false
+		var checkedPaths []string
 		for _, path := range libPaths {
 			if _, err := os.Stat(path); err == nil {
 				found = true
+				fmt.Printf("[GPU DETECT] Found CUDA library at: %s\n", path)
 				break
 			}
+			checkedPaths = append(checkedPaths, path)
 		}
 
 		// Fallback check: try running nvidia-smi to confirm active drivers
 		if !found {
-			cmd := exec.Command("nvidia-smi")
-			if err := cmd.Run(); err == nil {
-				found = true
+			smiPaths := []string{"nvidia-smi", "/usr/bin/nvidia-smi", "/usr/sbin/nvidia-smi"}
+			var lastSmiErr error
+			for _, smiPath := range smiPaths {
+				cmd := exec.Command(smiPath)
+				if err := cmd.Run(); err == nil {
+					found = true
+					fmt.Printf("[GPU DETECT] Found active GPU driver via %s\n", smiPath)
+					break
+				} else {
+					lastSmiErr = err
+				}
+			}
+			if !found {
+				fmt.Printf("[GPU DETECT] CUDA libraries not found in standard paths: %v\n", checkedPaths)
+				fmt.Printf("[GPU DETECT] nvidia-smi execution failed: %v\n", lastSmiErr)
 			}
 		}
 
 		if found {
-			fmt.Println("[GPU] Linux CUDA driver detected (libcuda.so or active nvidia-smi).")
 			return true
 		}
 	}
