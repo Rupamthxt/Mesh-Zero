@@ -18,6 +18,7 @@ func (w *Worker) StartAPIServer(port string) {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/peers", w.handleGetPeers)
+	mux.HandleFunc("/api/status", w.handleGetStatus)
 	mux.HandleFunc("/api/execute", w.handleExecuteTask)
 
 	mux.HandleFunc("/", func(res http.ResponseWriter, req *http.Request) {
@@ -174,5 +175,25 @@ func corsMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+func (w *Worker) handleGetStatus(res http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		http.Error(res, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	brokerAddr := os.Getenv("MESH_BROKER_ADDR")
+	if brokerAddr == "" {
+		brokerAddr = "localhost:8080"
+	}
+
+	res.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(res).Encode(map[string]interface{}{
+		"node_id":      w.ID,
+		"price_per_ms": w.PricePerMs,
+		"broker_addr":  brokerAddr,
+		"has_gpu":      currentNodeCapabilities.HasGPU,
 	})
 }

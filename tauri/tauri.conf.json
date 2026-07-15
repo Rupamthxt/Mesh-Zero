@@ -1,9 +1,10 @@
 {
   "build": {
-    "distDir": "../dist",
+    "distDir": "../../mesh-zero-web/dist",
     "devPath": "http://localhost:3000",
     "beforeDevCommand": "",
-    "beforeBuildCommand": ""
+    "beforeBuildCommand": "",
+    "withGlobalTauri": true
   },
   "package": {
     "productName": "MeshZero",
@@ -17,7 +18,10 @@
       "active": true,
       "targets": "all",
       "identifier": "com.meshzero.app",
-      "icon": []
+      "icon": [],
+      "externalBin": [
+        "bin/mesh-zero"
+      ]
     },
     "security": {
       "csp": null

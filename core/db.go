@@ -48,6 +48,14 @@ func InitDB() error {
 			receipt_json TEXT,
 			error TEXT,
 			tier INTEGER NOT NULL,
+			created_at INTEGER NOT NULL,
+			parent_id INTEGER DEFAULT 0
+		);`,
+		`CREATE TABLE IF NOT EXISTS payout_requests (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			worker_id TEXT NOT NULL,
+			amount REAL NOT NULL,
+			status TEXT NOT NULL,
 			created_at INTEGER NOT NULL
 		);`,
 	}
@@ -58,6 +66,9 @@ func InitDB() error {
 			return fmt.Errorf("migration failure: %v", err)
 		}
 	}
+
+	// Schema migration fallback: add parent_id if table already exists
+	_, _ = db.Exec("ALTER TABLE tasks ADD COLUMN parent_id INTEGER DEFAULT 0;")
 
 	dbInstance = db
 	fmt.Println("[DATABASE] SQLite database initialized successfully (WAL mode enabled).")
@@ -107,13 +118,18 @@ func SetBalanceDB(id string, bal float64) error {
 
 // CreateTaskDB inserts a new task record in pending state
 func CreateTaskDB(id uint64, wasmBytes []byte, dataBytes []byte, tier int) error {
+	return CreateTaskDBWithParent(id, wasmBytes, dataBytes, tier, 0)
+}
+
+// CreateTaskDBWithParent inserts a new task record with a batch parent ID
+func CreateTaskDBWithParent(id uint64, wasmBytes []byte, dataBytes []byte, tier int, parentID int64) error {
 	if dbInstance == nil {
 		return fmt.Errorf("db not initialized")
 	}
 	_, err := dbInstance.Exec(`
-		INSERT INTO tasks (id, wasm_bytes, data_bytes, status, tier, created_at)
-		VALUES (?, ?, ?, 'pending', ?, ?)
-	`, id, wasmBytes, dataBytes, tier, time.Now().UnixNano())
+		INSERT INTO tasks (id, wasm_bytes, data_bytes, status, tier, created_at, parent_id)
+		VALUES (?, ?, ?, 'pending', ?, ?, ?)
+	`, id, wasmBytes, dataBytes, tier, time.Now().UnixNano(), parentID)
 	return err
 }
 
@@ -145,6 +161,7 @@ type TaskRecord struct {
 	Error       string
 	Tier        int
 	CreatedAt   int64
+	ParentID    int64
 }
 
 // GetTaskDB fetches a task record by ID
@@ -159,9 +176,9 @@ func GetTaskDB(id uint64) (*TaskRecord, error) {
 	var errStr sql.NullString
 
 	err := dbInstance.QueryRow(`
-		SELECT id, wasm_bytes, data_bytes, status, stdout, receipt_json, error, tier, created_at
+		SELECT id, wasm_bytes, data_bytes, status, stdout, receipt_json, error, tier, created_at, parent_id
 		FROM tasks WHERE id = ?
-	`, id).Scan(&t.ID, &t.WasmBytes, &t.DataBytes, &t.Status, &stdout, &receipt, &errStr, &t.Tier, &t.CreatedAt)
+	`, id).Scan(&t.ID, &t.WasmBytes, &t.DataBytes, &t.Status, &stdout, &receipt, &errStr, &t.Tier, &t.CreatedAt, &t.ParentID)
 
 	if err != nil {
 		return nil, err
@@ -176,4 +193,95 @@ func GetTaskDB(id uint64) (*TaskRecord, error) {
 	}
 
 	return &t, nil
+}
+
+// GetBatchTasksDB fetches all sub-tasks belonging to a parent batch job
+func GetBatchTasksDB(parentID int64) ([]TaskRecord, error) {
+	if dbInstance == nil {
+		return nil, fmt.Errorf("db not initialized")
+	}
+
+	rows, err := dbInstance.Query(`
+		SELECT id, wasm_bytes, data_bytes, status, stdout, receipt_json, error, tier, created_at, parent_id
+		FROM tasks WHERE parent_id = ?
+	`, parentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var records []TaskRecord
+	for rows.Next() {
+		var t TaskRecord
+		var stdout []byte
+		var receipt sql.NullString
+		var errStr sql.NullString
+
+		err := rows.Scan(&t.ID, &t.WasmBytes, &t.DataBytes, &t.Status, &stdout, &receipt, &errStr, &t.Tier, &t.CreatedAt, &t.ParentID)
+		if err != nil {
+			return nil, err
+		}
+
+		t.Stdout = stdout
+		if receipt.Valid {
+			t.ReceiptJSON = receipt.String
+		}
+		if errStr.Valid {
+			t.Error = errStr.String
+		}
+		records = append(records, t)
+	}
+
+	return records, nil
+}
+
+type PayoutRequestRecord struct {
+	ID        int64   `json:"id"`
+	WorkerID  string  `json:"worker_id"`
+	Amount    float64 `json:"amount"`
+	Status    string  `json:"status"`
+	CreatedAt int64   `json:"created_at"`
+}
+
+// CreatePayoutRequestDB inserts a new payout request
+func CreatePayoutRequestDB(workerID string, amount float64) error {
+	if dbInstance == nil {
+		return fmt.Errorf("db not initialized")
+	}
+	_, err := dbInstance.Exec(`
+		INSERT INTO payout_requests (worker_id, amount, status, created_at)
+		VALUES (?, ?, 'pending', ?)
+	`, workerID, amount, time.Now().UnixNano())
+	return err
+}
+
+// GetPayoutRequestsDB retrieves all payout requests
+func GetPayoutRequestsDB() ([]PayoutRequestRecord, error) {
+	if dbInstance == nil {
+		return nil, fmt.Errorf("db not initialized")
+	}
+	rows, err := dbInstance.Query("SELECT id, worker_id, amount, status, created_at FROM payout_requests ORDER BY id DESC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var records []PayoutRequestRecord
+	for rows.Next() {
+		var r PayoutRequestRecord
+		if err := rows.Scan(&r.ID, &r.WorkerID, &r.Amount, &r.Status, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		records = append(records, r)
+	}
+	return records, nil
+}
+
+// UpdatePayoutRequestStatusDB updates a payout request status
+func UpdatePayoutRequestStatusDB(id int64, status string) error {
+	if dbInstance == nil {
+		return fmt.Errorf("db not initialized")
+	}
+	_, err := dbInstance.Exec("UPDATE payout_requests SET status = ? WHERE id = ?", status, id)
+	return err
 }

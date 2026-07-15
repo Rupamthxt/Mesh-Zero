@@ -26,7 +26,11 @@ func executeWasm(ctx context.Context, wasmBytes []byte, paramBytes []byte, hooks
 	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
 	defer cancel()
 
-	config := wazero.NewRuntimeConfig().WithMemoryLimitPages(100)
+	pages := uint32(currentNodeCapabilities.MaxRAm / 65536)
+	if pages == 0 {
+		pages = 8192 // Fallback to 512MB (8192 pages)
+	}
+	config := wazero.NewRuntimeConfig().WithMemoryLimitPages(pages)
 	r := wazero.NewRuntimeWithConfig(ctx, config)
 	defer r.Close(timeoutCtx)
 

@@ -1,16 +1,22 @@
 package core
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	quickjswasi "github.com/paralin/go-quickjs-wasi"
 )
 
 type WorkerConnection struct {
@@ -81,6 +87,14 @@ func (b *Broker) Start(port string) error {
 	mux.HandleFunc("/api/tasks/submit", b.handleTaskSubmit)
 	mux.HandleFunc("/api/tasks/status", b.handleTaskStatus)
 	mux.HandleFunc("/api/workers", b.handleGetWorkers)
+	mux.HandleFunc("/api/billing/checkout", b.handleCheckout)
+	mux.HandleFunc("/api/billing/stripe-webhook", b.handleStripeWebhook)
+	mux.HandleFunc("/api/billing/simulate-success", b.handleSimulateSuccess)
+	mux.HandleFunc("/api/payouts/request", b.handlePayoutRequest)
+	mux.HandleFunc("/api/payouts/list", b.handlePayoutList)
+	mux.HandleFunc("/api/payouts/approve", b.handlePayoutApprove)
+	mux.HandleFunc("/api/tasks/submit-batch", b.handleTaskSubmitBatch)
+	mux.HandleFunc("/api/tasks/batch-status", b.handleTaskBatchStatus)
 
 	fmt.Printf("[BROKER] Starting Central Broker Gateway on http://localhost:%s\n", port)
 	return http.ListenAndServe(":"+port, mux)
@@ -191,43 +205,53 @@ func (b *Broker) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 	// Parse multipart form
 	r.ParseMultipartForm(10 << 20)
 
-	wasmFile, _, err := r.FormFile("wasm")
+	script := r.FormValue("script")
 	var wasmBytes []byte
-	if err == nil {
-		defer wasmFile.Close()
-		wasmBytes, _ = io.ReadAll(wasmFile)
-	}
+	var dataBytes []byte
 
-	templateID := r.FormValue("template_id")
-	if templateID != "" {
-		var wasmPath string
-		if templateID == "hasher" {
-			wasmPath = "cmd/mesh-zero/hasher.wasm"
-		} else if templateID == "gpu_task" {
-			wasmPath = "task/gpu_task.wasm"
+	if script != "" {
+		// Use embedded QuickJS interpreter
+		wasmBytes = quickjswasi.QuickJSWASM
+		dataBytes = []byte(script)
+	} else {
+		// Fallback to standard WASM binary upload + input data
+		wasmFile, _, err := r.FormFile("wasm")
+		if err == nil {
+			defer wasmFile.Close()
+			wasmBytes, _ = io.ReadAll(wasmFile)
 		}
-		var rErr error
-		wasmBytes, rErr = os.ReadFile(wasmPath)
-		if rErr != nil {
-			wasmBytes, rErr = os.ReadFile("../" + wasmPath)
+
+		templateID := r.FormValue("template_id")
+		if templateID != "" {
+			var wasmPath string
+			if templateID == "hasher" {
+				wasmPath = "cmd/mesh-zero/hasher.wasm"
+			} else if templateID == "gpu_task" {
+				wasmPath = "task/gpu_task.wasm"
+			}
+			var rErr error
+			wasmBytes, rErr = os.ReadFile(wasmPath)
 			if rErr != nil {
-				wasmBytes, _ = os.ReadFile("../../" + wasmPath)
+				wasmBytes, rErr = os.ReadFile("../" + wasmPath)
+				if rErr != nil {
+					wasmBytes, _ = os.ReadFile("../../" + wasmPath)
+				}
 			}
 		}
-	}
 
-	if len(wasmBytes) == 0 {
-		http.Error(w, "Missing wasm task payload", http.StatusBadRequest)
-		return
-	}
+		if len(wasmBytes) == 0 {
+			http.Error(w, "Missing wasm task payload or script", http.StatusBadRequest)
+			return
+		}
 
-	dataFile, _, err := r.FormFile("data")
-	if err != nil {
-		http.Error(w, "Missing data input", http.StatusBadRequest)
-		return
+		dataFile, _, err := r.FormFile("data")
+		if err != nil {
+			http.Error(w, "Missing data input", http.StatusBadRequest)
+			return
+		}
+		defer dataFile.Close()
+		dataBytes, _ = io.ReadAll(dataFile)
 	}
-	defer dataFile.Close()
-	dataBytes, _ := io.ReadAll(dataFile)
 
 	targetTier := 0 // 0 means any tier
 	if tierStr := r.FormValue("tier"); tierStr != "" {
@@ -237,7 +261,7 @@ func (b *Broker) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 	taskID := uint64(time.Now().UnixNano())
 
 	// Create task record in pending state in SQLite
-	err = CreateTaskDB(taskID, wasmBytes, dataBytes, targetTier)
+	err := CreateTaskDB(taskID, wasmBytes, dataBytes, targetTier)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to queue task in DB: %v", err), http.StatusInternalServerError)
 		return
@@ -312,6 +336,7 @@ func (b *Broker) handleGetWorkers(w http.ResponseWriter, r *http.Request) {
 			"price_per_ms": worker.PricePerMs,
 			"tier":         worker.Tier,
 			"busy":         worker.Busy,
+			"balance":      GetBalanceDB(worker.ID),
 		})
 	}
 	b.workersMu.RUnlock()
@@ -403,4 +428,472 @@ func (b *Broker) startScheduler() {
 			b.taskQueue <- taskID
 		}
 	}
+}
+
+func setupCORS(w http.ResponseWriter, r *http.Request) bool {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return true
+	}
+	return false
+}
+
+func (b *Broker) handleCheckout(w http.ResponseWriter, r *http.Request) {
+	if setupCORS(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	amountStr := r.FormValue("amount")
+	accountID := r.FormValue("account_id")
+
+	if amountStr == "" || accountID == "" {
+		http.Error(w, "Missing amount or account_id", http.StatusBadRequest)
+		return
+	}
+
+	amount, err := strconv.ParseFloat(amountStr, 64)
+	if err != nil || amount <= 0 {
+		http.Error(w, "Invalid amount", http.StatusBadRequest)
+		return
+	}
+
+	secretKey := os.Getenv("STRIPE_SECRET_KEY")
+	if secretKey == "" {
+		// Fallback to simulation mode redirect
+		mockRedirectURL := fmt.Sprintf("http://localhost:8080/api/billing/simulate-success?account_id=%s&amount=%f", url.QueryEscape(accountID), amount)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"url": mockRedirectURL,
+		})
+		return
+	}
+
+	// Real Stripe checkout session
+	sessionURL, err := createStripeCheckoutSession(amount, accountID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Stripe checkout error: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"url": sessionURL,
+	})
+}
+
+func (b *Broker) handleSimulateSuccess(w http.ResponseWriter, r *http.Request) {
+	if setupCORS(w, r) {
+		return
+	}
+	accountID := r.URL.Query().Get("account_id")
+	amountStr := r.URL.Query().Get("amount")
+
+	if accountID == "" || amountStr == "" {
+		http.Error(w, "Missing account_id or amount", http.StatusBadRequest)
+		return
+	}
+
+	amount, _ := strconv.ParseFloat(amountStr, 64)
+	credits := amount * 100.0 // $1 USD = 100 credits
+
+	currentBalance := GetBalanceDB(accountID)
+	_ = SetBalanceDB(accountID, currentBalance+credits)
+
+	// Redirect back to console dashboard (detect host from referrer if available)
+	redirectURL := "http://localhost:3000/console.html?success=true"
+	if ref := r.Header.Get("Referer"); ref != "" {
+		if u, err := url.Parse(ref); err == nil {
+			redirectURL = fmt.Sprintf("%s://%s/console.html?success=true", u.Scheme, u.Host)
+		}
+	}
+	http.Redirect(w, r, redirectURL, http.StatusSeeOther)
+}
+
+func (b *Broker) handleStripeWebhook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	webhookSecret := os.Getenv("STRIPE_WEBHOOK_SECRET")
+	payload, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+
+	if webhookSecret != "" {
+		sigHeader := r.Header.Get("Stripe-Signature")
+		if !verifyStripeSignature(payload, sigHeader, webhookSecret) {
+			http.Error(w, "Invalid Stripe webhook signature", http.StatusUnauthorized)
+			return
+		}
+	}
+
+	var stripeEvent struct {
+		Type string `json:"type"`
+		Data struct {
+			Object struct {
+				Metadata struct {
+					AccountID string `json:"account_id"`
+					Amount    string `json:"amount"`
+				} `json:"metadata"`
+			} `json:"object"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(payload, &stripeEvent); err != nil {
+		http.Error(w, "Invalid webhook JSON", http.StatusBadRequest)
+		return
+	}
+
+	if stripeEvent.Type == "checkout.session.completed" {
+		accountID := stripeEvent.Data.Object.Metadata.AccountID
+		amountStr := stripeEvent.Data.Object.Metadata.Amount
+		if accountID != "" && amountStr != "" {
+			amount, _ := strconv.ParseFloat(amountStr, 64)
+			credits := amount * 100.0 // $1 USD = 100 credits
+
+			currentBal := GetBalanceDB(accountID)
+			_ = SetBalanceDB(accountID, currentBal+credits)
+			fmt.Printf("[BILLING] Stripe Webhook successfully processed. Deposited %.2f credits to %s\n", credits, accountID)
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func (b *Broker) handlePayoutRequest(w http.ResponseWriter, r *http.Request) {
+	if setupCORS(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	workerID := r.FormValue("worker_id")
+	amountStr := r.FormValue("amount")
+
+	if workerID == "" || amountStr == "" {
+		http.Error(w, "Missing worker_id or amount", http.StatusBadRequest)
+		return
+	}
+
+	amount, err := strconv.ParseFloat(amountStr, 64)
+	if err != nil || amount <= 0 {
+		http.Error(w, "Invalid amount", http.StatusBadRequest)
+		return
+	}
+
+	currentBal := GetBalanceDB(workerID)
+	if currentBal < amount {
+		http.Error(w, "Insufficient credit balance for payout", http.StatusBadRequest)
+		return
+	}
+
+	err = SetBalanceDB(workerID, currentBal-amount)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to update balance: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	err = CreatePayoutRequestDB(workerID, amount)
+	if err != nil {
+		_ = SetBalanceDB(workerID, currentBal) // Rollback
+		http.Error(w, fmt.Sprintf("Failed to record request: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "success",
+		"message": "Payout request successfully submitted and is pending approval",
+	})
+}
+
+func (b *Broker) handlePayoutList(w http.ResponseWriter, r *http.Request) {
+	if setupCORS(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	requests, err := GetPayoutRequestsDB()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to retrieve payout requests: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(requests)
+}
+
+func (b *Broker) handlePayoutApprove(w http.ResponseWriter, r *http.Request) {
+	if setupCORS(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	idStr := r.FormValue("id")
+	status := r.FormValue("status")
+
+	if idStr == "" || (status != "approved" && status != "rejected") {
+		http.Error(w, "Missing or invalid parameters", http.StatusBadRequest)
+		return
+	}
+
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid ID format", http.StatusBadRequest)
+		return
+	}
+
+	err = UpdatePayoutRequestStatusDB(id, status)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to update status: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "success",
+		"message": fmt.Sprintf("Payout request marked as %s", status),
+	})
+}
+
+func createStripeCheckoutSession(amount float64, accountID string) (string, error) {
+	secretKey := os.Getenv("STRIPE_SECRET_KEY")
+	if secretKey == "" {
+		return "", fmt.Errorf("STRIPE_SECRET_KEY not configured")
+	}
+
+	apiURL := "https://api.stripe.com/v1/checkout/sessions"
+	data := url.Values{}
+	data.Set("mode", "payment")
+	data.Set("success_url", "https://console.meshzero.network/console.html?session_id={CHECKOUT_SESSION_ID}&success=true")
+	data.Set("cancel_url", "https://console.meshzero.network/console.html?success=false")
+	data.Set("line_items[0][price_data][currency]", "usd")
+	cents := int64(amount * 100)
+	data.Set("line_items[0][price_data][unit_amount]", fmt.Sprintf("%d", cents))
+	data.Set("line_items[0][price_data][product_data][name]", "MeshØ Compute Credits")
+	data.Set("line_items[0][quantity]", "1")
+	data.Set("metadata[account_id]", accountID)
+	data.Set("metadata[amount]", fmt.Sprintf("%f", amount))
+
+	req, err := http.NewRequest("POST", apiURL, strings.NewReader(data.Encode()))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth(secretKey, "")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("stripe error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var session struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(body, &session); err != nil {
+		return "", err
+	}
+
+	return session.URL, nil
+}
+
+func verifyStripeSignature(payload []byte, sigHeader, webhookSecret string) bool {
+	if sigHeader == "" || webhookSecret == "" {
+		return false
+	}
+
+	parts := strings.Split(sigHeader, ",")
+	var timestamp string
+	var signature string
+	for _, part := range parts {
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) == 2 {
+			if kv[0] == "t" {
+				timestamp = kv[1]
+			} else if kv[0] == "v1" {
+				signature = kv[1]
+			}
+		}
+	}
+
+	if timestamp == "" || signature == "" {
+		return false
+	}
+
+	signedPayload := timestamp + "." + string(payload)
+
+	mac := hmac.New(sha256.New, []byte(webhookSecret))
+	mac.Write([]byte(signedPayload))
+	expectedMac := hex.EncodeToString(mac.Sum(nil))
+
+	return hmac.Equal([]byte(signature), []byte(expectedMac))
+}
+
+func (b *Broker) handleTaskSubmitBatch(w http.ResponseWriter, r *http.Request) {
+	if setupCORS(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	script := r.FormValue("script")
+	inputsJSON := r.FormValue("inputs")
+	tierStr := r.FormValue("tier")
+
+	if script == "" || inputsJSON == "" {
+		http.Error(w, "Missing script or inputs", http.StatusBadRequest)
+		return
+	}
+
+	var inputs []string
+	if err := json.Unmarshal([]byte(inputsJSON), &inputs); err != nil {
+		http.Error(w, "Invalid inputs JSON format (must be string array)", http.StatusBadRequest)
+		return
+	}
+
+	if len(inputs) == 0 {
+		http.Error(w, "Inputs array cannot be empty", http.StatusBadRequest)
+		return
+	}
+
+	targetTier := 0
+	if tierStr != "" {
+		fmt.Sscanf(tierStr, "%d", &targetTier)
+	}
+
+	parentID := int64(time.Now().UnixNano())
+	wasmBytes := quickjswasi.QuickJSWASM
+
+	// Queue all sub-tasks in parallel
+	for i, input := range inputs {
+		subTaskID := uint64(time.Now().UnixNano()) + uint64(i)
+		
+		// Prepend target URL parameter to the script scope
+		wrappedScript := fmt.Sprintf("const __INPUT__ = %q;\n%s", input, script)
+
+		err := CreateTaskDBWithParent(subTaskID, wasmBytes, []byte(wrappedScript), targetTier, parentID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to queue batch subtask: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		// Queue the task for the scheduler matchmaking loop
+		b.taskQueue <- subTaskID
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":      "success",
+		"batch_id":    parentID,
+		"tasks_count": len(inputs),
+		"message":     fmt.Sprintf("Batch job queued with %d parallel scraping tasks", len(inputs)),
+	})
+}
+
+func (b *Broker) handleTaskBatchStatus(w http.ResponseWriter, r *http.Request) {
+	if setupCORS(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	parentIDStr := r.URL.Query().Get("parent_id")
+	if parentIDStr == "" {
+		http.Error(w, "Missing parent_id", http.StatusBadRequest)
+		return
+	}
+
+	parentID, err := strconv.ParseInt(parentIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid parent_id format", http.StatusBadRequest)
+		return
+	}
+
+	records, err := GetBatchTasksDB(parentID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to fetch batch tasks: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	total := len(records)
+	if total == 0 {
+		http.Error(w, "No tasks found for the specified batch ID", http.StatusNotFound)
+		return
+	}
+
+	pendingCount := 0
+	runningCount := 0
+	completedCount := 0
+	failedCount := 0
+
+	var outputs []string
+	var errors []string
+
+	for _, rec := range records {
+		switch rec.Status {
+		case "pending":
+			pendingCount++
+		case "running":
+			runningCount++
+		case "completed":
+			completedCount++
+			outputs = append(outputs, string(rec.Stdout))
+		case "failed":
+			failedCount++
+			errors = append(errors, rec.Error)
+		}
+	}
+
+	progressPercent := float64(completedCount+failedCount) / float64(total) * 100.0
+	status := "running"
+	if completedCount+failedCount == total {
+		if failedCount > 0 {
+			status = "failed"
+		} else {
+			status = "completed"
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"batch_id":         parentID,
+		"status":           status,
+		"progress_percent": progressPercent,
+		"tasks_total":      total,
+		"tasks_pending":    pendingCount,
+		"tasks_running":    runningCount,
+		"tasks_completed":  completedCount,
+		"tasks_failed":     failedCount,
+		"outputs":          outputs,
+		"errors":           errors,
+	})
 }

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -43,6 +44,13 @@ var currentNodeCapabilities = NodeCapabilities{
 
 
 func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) error {
+	// Parse dynamic memory limit from environment variable (in Megabytes)
+	if ramStr := os.Getenv("MESH_MAX_RAM"); ramStr != "" {
+		if ramMB, err := strconv.Atoi(ramStr); err == nil && ramMB > 0 {
+			currentNodeCapabilities.MaxRAm = uint64(ramMB) * 1024 * 1024
+		}
+	}
+
 	privKeyHex, err := ensureLocalKeyPair()
 	if err != nil {
 		return fmt.Errorf("failed to load/generate worker key: %v", err)
@@ -57,7 +65,7 @@ func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) erro
 	fmt.Println("========================================")
 	fmt.Println(" MESH-ZERO LIGHTWEIGHT WORKER INITIALIZED")
 	fmt.Printf("  Worker ID: %s\n", w.ID)
-	fmt.Printf("  GPU Accel: %v | Max RAM: %d MB\n", currentNodeCapabilities.HasGPU, currentNodeCapabilities.MaxRAm)
+	fmt.Printf("  GPU Accel: %v | Max RAM: %d MB\n", currentNodeCapabilities.HasGPU, currentNodeCapabilities.MaxRAm / (1024 * 1024))
 	fmt.Printf("  Pricing:   %.4f credits/ms\n", w.PricePerMs)
 	fmt.Println("========================================")
 
