@@ -1,118 +1,137 @@
-# MeshØ
+# MeshØ (Mesh-Zero)
 
 ![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Status](https://img.shields.io/badge/Status-Beta-orange)
 
-**Mesh-Zero** is a CGO-free, zero-infrastructure, peer-to-peer WebAssembly (WASM) execution engine. 
+**MeshØ** is a CGO-free, lightweight, and verifiable WebAssembly (WASM) compute pool. It turns standard consumer hardware—from gaming rigs to Apple Silicon MacBooks—into a secure, globally distributed serverless execution network.
 
-It allows you to turn any group of devices—from MacBooks to Raspberry Pis—into a secure, globally routed serverless compute cluster. There are no centralized coordinators, no Docker containers, and no external infrastructure required. It compiles down to a single, static binary.
-
-## Core Features
-
-* **Zero Infrastructure:** Nodes automatically discover each other via the global Kademlia DHT. No central databases or API servers are needed.
-* **Global NAT Traversal:** Built-in UPnP and AutoRelay allow nodes to securely connect across the public internet, even behind strict home routers and firewalls.
-* **Sandboxed Execution:** Untrusted `.wasm` payloads are executed using [wazero](https://github.com/tetratelabs/wazero). The engine strictly enforces memory ceilings (6.4MB max) and execution timeouts (5-second fuel limit) natively in Go, preventing infinite loops and malicious payloads.
-* **Idempotent Atomic Scheduling:** Uses a custom `MZ03` binary protocol with double-checked locking and thread-safe caching to ensure a payload is only ever executed once, even during mDNS discovery storms.
-* **Embedded Control Plane:** Features a zero-dependency Visual Dashboard compiled directly into the binary using `//go:embed`.
+Unlike heavy container orchestration networks, MeshØ runs workloads inside a secure **Wazero WebAssembly sandbox** or an **embedded JavaScript/WebGPU interpreter**, compiling down to a single static binary.
 
 ---
 
-## The `MZ03` Wire Protocol
+## 🏗️ Core Architecture
 
-To eliminate HTTP overhead, Mesh-Zero nodes communicate via multiplexed `libp2p` streams using a highly optimized 84-byte binary header.
+MeshØ uses a high-performance **Broker & Worker WebSocket architecture**:
 
-| Field | Type | Size | Description |
-| :--- | :--- | :--- | :--- |
-| **Magic** | `[4]byte` | 4 Bytes | Protocol Identifier (`MZ03`). |
-| **TaskID** | `uint64` | 8 Bytes | Unique ID to prevent double-execution across the mesh. |
-| **WasmLen** | `uint32` | 4 Bytes | Byte size of the executable payload. |
-| **ParamLen**| `uint32` | 4 Bytes | Byte size of the Stdin parameter data. |
-| **Signature** | `[64]byte` | 64 Bytes | ed25519 hash of the header data for verification of the header |
-| **Payload** | `[]byte` | Variable | The `.wasm` binary followed immediately by the input data. |
+```
+ [ Compute Buyers ] ──────►  [ Central Broker ]  ◄────── [ Worker Nodes ]
+  (CLI, curl, Web Console)    - Matchmaking Scheduler    - Wazero WASM Sandbox
+                              - SQLite Job Logs          - JS / WebGPU Polyfill
+                              - REST Submission APIs     - Cryptographic Receipts
+```
+
+*   **Central Broker:** Acts as the network gateway, receiving tasks via REST APIs, managing scheduling state in a WAL-mode SQLite database, and matchmaking workloads to registered nodes.
+*   **Lightweight Workers:** Connect to the Broker via WebSockets, pull queued tasks, execute them inside a secure CPU/GPU sandbox, and sign a cryptographic proof-of-work receipt.
+*   **WASM Sandbox (Wazero):** Runs untrusted pre-compiled WebAssembly binaries with strict memory limits (`WithMemoryLimitPages`) and execution timeouts.
+*   **Headless WebGPU JavaScript Sandbox:** Allows developers to submit standard, browser-compatible WebGPU JavaScript code. An embedded polyfill inside QuickJS intercepts the calls and runs compute shaders natively on the worker's hardware (Metal on macOS, CUDA on Windows/Linux).
 
 ---
 
-## Quickstart
+## ⚡ Quickstart
 
 ### Prerequisites
-* **Go** (v1.21+)
-* **TinyGo** (For compiling WASI-compatible payloads)
+*   **Go** (v1.22+)
+*   **NVIDIA Drivers** (Optional, for CUDA GPU acceleration on Linux/Windows)
 
-### 1. Install
-Clone the repository and build the binary:
+### 1. Compile the Project
+Clone the repository and compile the static binary:
 ```bash
 git clone https://github.com/Rupamthxt/Mesh-Zero.git
 cd mesh-zero
 go build -o mesh-zero cmd/mesh-zero/main.go
 ```
 
-### 2. Generate a public and private key
-The key acts as a security to verify if the payload is from a ledgit worker.
+### 2. Generate Security Keys
+Create your worker authentication key pair. The private key secures proof-of-work receipts:
 ```bash
 ./mesh-zero keygen
 ```
-Output:
+Export the keys to your environment:
 ```bash
-PUBLIC KEY (Give to Workers): Public Key
-PRIVATE KEY (Keep Secret): Private Key
---------------------------------------------------
-Export these as environment variables before starting nodes:
 export MESH_PUB_KEY=<your_public_key>
 export MESH_PRIV_KEY=<your_private_key>
 ```
 
-### 3. Start a Worker Node
-The Worker acts as the compute engine. It binds to all interfaces, advertises itself via DTH, and listens for WASM payloads.
+### 3. Launch the Central Broker
+Start the coordinator server on port `8080`:
+```bash
+./mesh-zero broker start 8080
+```
 
+### 4. Start a Worker Node
+Launch a compute worker in another terminal, pointing to the broker. You can specify the worker price per millisecond of calculation (e.g., `0.01` credits/ms):
 ```bash
-./mesh-zero worker start 8080
+./mesh-zero worker start 8085 0.01
 ```
-(Open http://localhost:8080 in your browser to view the embedded Control Plane dashboard).
-Output:
-```bash
-Worker Node 12D3KooW... listening. Waiting for tasks...
+
+---
+
+## 💻 Submitting Workloads
+
+### Option A: Standard JavaScript / WebGPU Compute
+MeshØ supports running browser-compatible WebGPU scripts directly on the network with **zero WASM compilation**.
+
+Create a WebGPU script (`multiply.js`):
+```javascript
+async function runGPU() {
+    const adapter = await navigator.gpu.requestAdapter();
+    const device = await adapter.requestDevice();
+    
+    // ... setup storage buffers and WGSL compute shader code ...
+    
+    device.queue.submit([commandEncoder.finish()]);
+    
+    await readBuffer.mapAsync(GPUMapMode.READ);
+    const result = new Float32Array(readBuffer.getMappedRange());
+    console.log("GPU Computation Result:", result);
+}
+runGPU();
 ```
-### 4. Compile a WASM task
-Write a generic task in Go. Mesh-Zero uses `os.Stdin` to inject parameters and `os.Stdout` to stream results.
+
+Submit it directly via the REST endpoint:
 ```bash
-# hasher.go
+curl -X POST -F "script=<multiply.js" http://localhost:8080/api/tasks/submit
+```
+
+### Option B: Compiling & Submitting WebAssembly (WASM)
+Write a stateless program in Go (or Rust) that reads input from `os.Stdin` and writes output to `os.Stdout`:
+```go
+// main.go
 package main
-
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"io"
 	"os"
 )
-
 func main() {
 	input, _ := io.ReadAll(os.Stdin)
 	hash := sha256.Sum256(input)
-	fmt.Printf("[WASM] SHA-256: %s\n", hex.EncodeToString(hash[:]))
+	os.Stdout.Write([]byte(hex.EncodeToString(hash[:])))
 }
 ```
-Compile it to a lightweight WASI binary:
-```bash
-tinygo build -o hasher.wasm -target=wasi hasher.go
-```
-### 5. Submit the task via the sender
-The Sender acts as a load balancer. It discovers available Workers, atomically locks a stream, and blasts the payload.
 
-Create a data file to process:
+Compile to WebAssembly WASI:
 ```bash
-echo "Hello from the decentralized edge!" > input.txt
+tinygo build -o hasher.wasm -target=wasi main.go
 ```
-Send it to the mesh:
+
+Submit the binary with an input parameter file:
 ```bash
-./mesh-zero run hasher.wasm input.txt
+echo "Hello MeshØ!" > input.txt
+./mesh-zero run hasher.wasm input.txt 0.05
 ```
-Or use the dashboard to upload the task
 
-The CLI will ping your local daemon, locate a remote peer on the global DHT, transmit the payload, and stream the standard output back to your terminal in milliseconds.
+---
 
-## Contributing
-Contributions are welcome! Currently looking for help with:
-* Implementing an explicit "Fuel" metric (instruction counting) instead of just time limits.
-* Creating an SDK for Rust and AssemblyScript guest payloads.
+## 🛡️ Sandbox Resource Boundaries
+
+Workers configure strict sandbox execution limits on startup via environment variables:
+*   `MESH_MAX_RAM`: Memory limits in bytes mapped to Wazero pages (e.g. `536870912` for 512MB limit).
+*   `MESH_TASK_TIMEOUT`: Maximum execution limit in seconds before the task is forcefully killed (Default: `5` seconds).
+
+---
+
+## 📄 License
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

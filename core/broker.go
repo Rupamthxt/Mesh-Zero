@@ -941,21 +941,44 @@ class MockGPUDevice {
 		
 		this.pendingCopies = [];
 		this.queue = {
+			writeBuffer: (buffer, offset, data) => {
+				buffer.data.set(data);
+			},
 			submit: (encoders) => {
 				// Evaluate the shader math natively inside the javascript runtime:
 				// Map input buffer values and calculate output values dynamically.
 				if (this.activeBindGroup) {
-					const first = this.activeBindGroup.entries.find(e => e.binding === 0).resource.buffer.data;
-					const second = this.activeBindGroup.entries.find(e => e.binding === 1).resource.buffer.data;
-					const result = this.activeBindGroup.entries.find(e => e.binding === 2).resource.buffer.data;
+					const entries = this.activeBindGroup.entries;
+					const firstEntry = entries.find(e => e.binding === 0);
+					const secondEntry = entries.find(e => e.binding === 1);
+					const thirdEntry = entries.find(e => e.binding === 2);
 					
-					let op = (a, b) => a * b; // Default operation multiplication
-					if (this.activeShader.includes("+")) op = (a, b) => a + b;
-					else if (this.activeShader.includes("-")) op = (a, b) => a - b;
-					else if (this.activeShader.includes("/")) op = (a, b) => a / b;
+					if (firstEntry && secondEntry && !thirdEntry) {
+						// 2-buffer unary operations (e.g. inputData * inputData squaring)
+						const first = firstEntry.resource.buffer.data;
+						const result = secondEntry.resource.buffer.data;
+						
+						let op = (a) => a * a; // Default square operator
+						if (this.activeShader.includes("+")) op = (a) => a + a;
+						else if (this.activeShader.includes("-")) op = (a) => 0;
 
-					for (let i = 0; i < first.length; i++) {
-						result[i] = op(first[i], second[i]);
+						for (let i = 0; i < first.length; i++) {
+							result[i] = op(first[i]);
+						}
+					} else if (firstEntry && secondEntry && thirdEntry) {
+						// 3-buffer binary operations (e.g. first * second = result)
+						const first = firstEntry.resource.buffer.data;
+						const second = secondEntry.resource.buffer.data;
+						const result = thirdEntry.resource.buffer.data;
+						
+						let op = (a, b) => a * b; // Default operation multiplication
+						if (this.activeShader.includes("+")) op = (a, b) => a + b;
+						else if (this.activeShader.includes("-")) op = (a, b) => a - b;
+						else if (this.activeShader.includes("/")) op = (a, b) => a / b;
+
+						for (let i = 0; i < first.length; i++) {
+							result[i] = op(first[i], second[i]);
+						}
 					}
 				}
 				
@@ -1014,5 +1037,16 @@ Object.defineProperty(globalThis, 'navigator', {
 	writable: true,
 	configurable: true
 });
+
+globalThis.document = {
+	getElementById: (id) => ({
+		set innerText(val) {
+			console.log("[DOM " + id + "] " + val);
+		},
+		get innerText() {
+			return "";
+		}
+	})
+};
 `
 

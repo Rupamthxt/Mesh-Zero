@@ -8,3 +8,5 @@ dist/
 *.db-wal
 *.db
 mesh-zero
+mesh_worker.key
+mesh-zero-*
