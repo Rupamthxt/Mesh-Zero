@@ -13,7 +13,7 @@ import (
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
 
-func executeWasm(ctx context.Context, wasmBytes []byte, paramBytes []byte, hooks []ExtensionHook, out io.Writer) (time.Duration, error) {
+func executeWasm(ctx context.Context, wasmBytes []byte, paramBytes []byte, hooks []ExtensionHook, out io.Writer, args []string) (time.Duration, error) {
 	startTime := time.Now()
 
 	timeoutSeconds := 5
@@ -49,10 +49,18 @@ func executeWasm(ctx context.Context, wasmBytes []byte, paramBytes []byte, hooks
 		return time.Since(startTime), err
 	}
 
-	mod, err := r.InstantiateModule(timeoutCtx, compiledMod, wazero.NewModuleConfig().
+	moduleConfig := wazero.NewModuleConfig().
 		WithStdout(out).
 		WithStderr(out).
-		WithStdin(bytes.NewReader(paramBytes)))
+		WithStdin(bytes.NewReader(paramBytes))
+	
+	if len(args) > 0 {
+		moduleConfig = moduleConfig.WithArgs(args...)
+	} else {
+		moduleConfig = moduleConfig.WithArgs("wasm_app")
+	}
+
+	mod, err := r.InstantiateModule(timeoutCtx, compiledMod, moduleConfig)
 
 	if err != nil {
 		if timeoutCtx.Err() == context.DeadlineExceeded {

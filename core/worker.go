@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	quickjswasi "github.com/paralin/go-quickjs-wasi"
 	"github.com/tetratelabs/wazero"
 )
 
@@ -129,7 +130,11 @@ func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) erro
 				
 				// Execute WASM sandbox in memory
 				var outBuf bytes.Buffer
-				duration, execErr := executeWasm(ctx, dispatch.WasmBytes, dispatch.DataBytes, w.Hooks, &outBuf)
+				var wasmArgs []string
+				if bytes.Equal(dispatch.WasmBytes, quickjswasi.QuickJSWASM) {
+					wasmArgs = []string{"qjs", "-e", string(dispatch.DataBytes)}
+				}
+				duration, execErr := executeWasm(ctx, dispatch.WasmBytes, dispatch.DataBytes, w.Hooks, &outBuf, wasmArgs)
 
 				var errStr string
 				if execErr != nil {

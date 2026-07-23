@@ -6,4 +6,5 @@
 dist/
 *.db-shm
 *.db-wal
+*.db
 mesh-zero

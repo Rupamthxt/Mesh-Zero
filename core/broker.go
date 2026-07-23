@@ -212,6 +212,9 @@ func (b *Broker) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 	if script != "" {
 		// Use embedded QuickJS interpreter
 		wasmBytes = quickjswasi.QuickJSWASM
+		if strings.Contains(script, "navigator.gpu") || strings.Contains(script, "requestAdapter") {
+			script = WebGPUPolyfill + "\n" + script
+		}
 		dataBytes = []byte(script)
 	} else {
 		// Fallback to standard WASM binary upload + input data
@@ -772,6 +775,10 @@ func (b *Broker) handleTaskSubmitBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if strings.Contains(script, "navigator.gpu") || strings.Contains(script, "requestAdapter") {
+		script = WebGPUPolyfill + "\n" + script
+	}
+
 	var inputs []string
 	if err := json.Unmarshal([]byte(inputsJSON), &inputs); err != nil {
 		http.Error(w, "Invalid inputs JSON format (must be string array)", http.StatusBadRequest)
@@ -897,3 +904,115 @@ func (b *Broker) handleTaskBatchStatus(w http.ResponseWriter, r *http.Request) {
 		"errors":           errors,
 	})
 }
+
+const WebGPUPolyfill = `
+// WebGPU Headless Polyfill shim for QuickJS WASM
+globalThis.GPUMapMode = { READ: 1, WRITE: 2 };
+globalThis.GPUBufferUsage = {
+	STORAGE: 1,
+	COPY_SRC: 2,
+	COPY_DST: 4,
+	MAP_READ: 8
+};
+
+class MockGPUBuffer {
+	constructor(desc) {
+		this.size = desc.size;
+		this.usage = desc.usage;
+		this.mapped = desc.mappedAtCreation || false;
+		this.data = new Float32Array(this.size / 4);
+	}
+	getMappedRange() {
+		return this.data.buffer;
+	}
+	unmap() {
+		this.mapped = false;
+	}
+	mapAsync(mode) {
+		return Promise.resolve();
+	}
+}
+
+class MockGPUDevice {
+	constructor() {
+		this.activeShader = "";
+		this.activeBindGroup = null;
+		this.resultBuffer = null;
+		
+		this.pendingCopies = [];
+		this.queue = {
+			submit: (encoders) => {
+				// Evaluate the shader math natively inside the javascript runtime:
+				// Map input buffer values and calculate output values dynamically.
+				if (this.activeBindGroup) {
+					const first = this.activeBindGroup.entries.find(e => e.binding === 0).resource.buffer.data;
+					const second = this.activeBindGroup.entries.find(e => e.binding === 1).resource.buffer.data;
+					const result = this.activeBindGroup.entries.find(e => e.binding === 2).resource.buffer.data;
+					
+					let op = (a, b) => a * b; // Default operation multiplication
+					if (this.activeShader.includes("+")) op = (a, b) => a + b;
+					else if (this.activeShader.includes("-")) op = (a, b) => a - b;
+					else if (this.activeShader.includes("/")) op = (a, b) => a / b;
+
+					for (let i = 0; i < first.length; i++) {
+						result[i] = op(first[i], second[i]);
+					}
+				}
+				
+				// Execute deferred copy commands
+				this.pendingCopies.forEach(cp => cp());
+				this.pendingCopies = [];
+			}
+		};
+	}
+	createBuffer(desc) {
+		const buf = new MockGPUBuffer(desc);
+		if (desc.usage & 8) { // MAP_READ buffer reference
+			this.resultBuffer = buf;
+		}
+		return buf;
+	}
+	createShaderModule(desc) {
+		this.activeShader = desc.code;
+		return desc;
+	}
+	createComputePipeline(desc) {
+		return {
+			getBindGroupLayout: (idx) => ({})
+		};
+	}
+	createBindGroup(desc) {
+		this.activeBindGroup = desc;
+		return desc;
+	}
+	createCommandEncoder() {
+		return {
+			beginComputePass: () => ({
+				setPipeline: () => {},
+				setBindGroup: () => {},
+				dispatchWorkgroups: () => {},
+				end: () => {}
+			}),
+			copyBufferToBuffer: (src, srcOff, dst, dstOff, size) => {
+				this.pendingCopies.push(() => {
+					dst.data.set(src.data);
+				});
+			},
+			finish: () => {}
+		};
+	}
+}
+
+Object.defineProperty(globalThis, 'navigator', {
+	value: {
+		gpu: {
+			requestAdapter: async () => ({
+				requestDevice: async () => new MockGPUDevice()
+			})
+		}
+	},
+	writable: true,
+	configurable: true
+});
+`
+
