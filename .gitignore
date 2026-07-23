@@ -1,6 +1,7 @@
 *.log
 *.wasm
 *.pid
+.DS_Store
 *.txt
 # Added by goreleaser init:
 dist/
