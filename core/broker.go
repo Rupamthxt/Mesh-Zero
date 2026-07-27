@@ -38,8 +38,8 @@ type Broker struct {
 
 func NewBroker() *Broker {
 	b := &Broker{
-		workers:   make(map[string]*WorkerConnection),
-		taskQueue: make(chan uint64, 1000),
+		workers:     make(map[string]*WorkerConnection),
+		taskQueue:   make(chan uint64, 1000),
 		activeTasks: make(map[uint64]string),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
@@ -227,9 +227,10 @@ func (b *Broker) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 		templateID := r.FormValue("template_id")
 		if templateID != "" {
 			var wasmPath string
-			if templateID == "hasher" {
+			switch templateID {
+			case "hasher":
 				wasmPath = "cmd/mesh-zero/hasher.wasm"
-			} else if templateID == "gpu_task" {
+			case "gpu_task":
 				wasmPath = "task/gpu_task.wasm"
 			}
 			var rErr error
@@ -617,7 +618,7 @@ func (b *Broker) handlePayoutRequest(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"status": "success",
+		"status":  "success",
 		"message": "Payout request successfully submitted and is pending approval",
 	})
 }
@@ -672,7 +673,7 @@ func (b *Broker) handlePayoutApprove(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"status": "success",
+		"status":  "success",
 		"message": fmt.Sprintf("Payout request marked as %s", status),
 	})
 }
@@ -736,9 +737,10 @@ func verifyStripeSignature(payload []byte, sigHeader, webhookSecret string) bool
 	for _, part := range parts {
 		kv := strings.SplitN(part, "=", 2)
 		if len(kv) == 2 {
-			if kv[0] == "t" {
+			switch kv[0] {
+			case "t":
 				timestamp = kv[1]
-			} else if kv[0] == "v1" {
+			case "v1":
 				signature = kv[1]
 			}
 		}
@@ -801,7 +803,7 @@ func (b *Broker) handleTaskSubmitBatch(w http.ResponseWriter, r *http.Request) {
 	// Queue all sub-tasks in parallel
 	for i, input := range inputs {
 		subTaskID := uint64(time.Now().UnixNano()) + uint64(i)
-		
+
 		// Prepend target URL parameter to the script scope
 		wrappedScript := fmt.Sprintf("const __INPUT__ = %q;\n%s", input, script)
 
@@ -1049,4 +1051,3 @@ globalThis.document = {
 	})
 };
 `
-

@@ -86,11 +86,12 @@ func (w *Worker) handleExecuteTask(res http.ResponseWriter, req *http.Request) {
 	templateID := req.FormValue("template_id")
 	if templateID != "" {
 		var wasmPath string
-		if templateID == "hasher" {
+		switch templateID {
+		case "hasher":
 			wasmPath = "cmd/mesh-zero/hasher.wasm"
-		} else if templateID == "gpu_task" {
+		case "gpu_task":
 			wasmPath = "task/gpu_task.wasm"
-		} else {
+		default:
 			http.Error(res, "Unknown template ID", http.StatusBadRequest)
 			return
 		}
@@ -195,5 +196,6 @@ func (w *Worker) handleGetStatus(res http.ResponseWriter, req *http.Request) {
 		"price_per_ms": w.PricePerMs,
 		"broker_addr":  brokerAddr,
 		"has_gpu":      currentNodeCapabilities.HasGPU,
+		"max_ram":      currentNodeCapabilities.MaxRAm,
 	})
 }
