@@ -161,3 +161,32 @@ If executing steps manually on the Droplet:
     }
     ```
     *Reload Caddy: `systemctl reload caddy`.*
+
+---
+
+## 6. Standalone One-Click PC Client (Attick-Worker)
+
+For normal PC users to join the mesh with a single click, compile the standalone `attick-worker` console app. It is pre-routed to your production global server and automatically handles key generation and registration without any terminal commands.
+
+### A. Configure Your Global Broker Address
+Open [main.go](file:///Users/rupamthxt/Projects/mesh-zero/cmd/attick-worker/main.go) and update the `GlobalBrokerAddr` constant with your production droplet's public IP/Domain:
+```go
+const GlobalBrokerAddr = "YOUR_GLOBAL_SERVER_IP:8080"
+```
+
+### B. Cross-Compile for Windows PC (From macOS/Linux)
+Generate a CGO-free, zero-dependency Windows executable:
+```bash
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o dist/attick-worker.exe cmd/attick-worker/main.go
+```
+*Simply send the compiled `attick-worker.exe` to Windows users. When they double-click the file, it opens a formatted console panel and registers their PC to your global server automatically.*
+
+### C. Compile for macOS and Linux PCs
+*   **macOS:**
+    ```bash
+    go build -o dist/attick-worker-mac cmd/attick-worker/main.go
+    ```
+*   **Linux:**
+    ```bash
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/attick-worker-linux cmd/attick-worker/main.go
+    ```

@@ -9,5 +9,6 @@ dist/
 *.db-wal
 *.db
 mesh-zero
+attick-worker
 mesh_worker.key
 mesh-zero-*

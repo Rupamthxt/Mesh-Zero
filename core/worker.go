@@ -7,9 +7,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -131,10 +135,72 @@ func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) erro
 				// Execute WASM sandbox in memory
 				var outBuf bytes.Buffer
 				var wasmArgs []string
+				var executionData = dispatch.DataBytes
+
 				if bytes.Equal(dispatch.WasmBytes, quickjswasi.QuickJSWASM) {
-					wasmArgs = []string{"qjs", "-e", string(dispatch.DataBytes)}
+					jsCode := string(dispatch.DataBytes)
+					
+					// Detect if this is a residential web scraping request
+					reInput := regexp.MustCompile(`const\s+__INPUT__\s*=\s*["']([^"']+)["'];`)
+					match := reInput.FindStringSubmatch(jsCode)
+					if len(match) > 1 {
+						targetURL := match[1]
+						if strings.HasPrefix(targetURL, "http://") || strings.HasPrefix(targetURL, "https://") {
+							fmt.Printf("[WORKER] Residential Scraper: Pre-fetching URL: %s\n", targetURL)
+							
+							// Fetch the content natively on the host using worker's residential IP
+							fetchedBody, statusCode, isOk, fetchErr := fetchURLFromHost(targetURL)
+							
+							var errStr string
+							if fetchErr != nil {
+								errStr = fetchErr.Error()
+								fmt.Printf("[WORKER] Pre-fetch failed: %v\n", fetchErr)
+							} else {
+								fmt.Printf("[WORKER] Pre-fetch complete. Size: %d bytes | Status: %d\n", len(fetchedBody), statusCode)
+							}
+							
+							escapedBody, _ := json.Marshal(fetchedBody)
+							escapedErr, _ := json.Marshal(errStr)
+							
+							// Prepend the fetch polyfill to override globalThis.fetch inside QuickJS
+							polyfill := fmt.Sprintf(`
+globalThis.fetch = function(url) {
+	if (url === __INPUT__) {
+		const errStr = %s;
+		if (errStr) {
+			return Promise.reject(new Error(errStr));
+		}
+		return Promise.resolve({
+			ok: %t,
+			status: %d,
+			text: () => Promise.resolve(%s),
+			json: () => {
+				try {
+					return Promise.resolve(JSON.parse(%s));
+				} catch (e) {
+					return Promise.reject(e);
 				}
-				duration, execErr := executeWasm(ctx, dispatch.WasmBytes, dispatch.DataBytes, w.Hooks, &outBuf, wasmArgs)
+			}
+		});
+	}
+	return Promise.reject(new Error("MeshØ Sandbox error: fetch is only allowed for the assigned __INPUT__ URL."));
+};
+`, escapedErr, isOk, statusCode, string(escapedBody), string(escapedBody))
+							
+							// Prepend polyfill after the __INPUT__ definition
+							newLineIdx := strings.Index(jsCode, "\n")
+							if newLineIdx != -1 {
+								jsCode = jsCode[:newLineIdx+1] + polyfill + jsCode[newLineIdx+1:]
+							} else {
+								jsCode = polyfill + jsCode
+							}
+							
+							executionData = []byte(jsCode)
+						}
+					}
+					wasmArgs = []string{"qjs", "-e", string(executionData)}
+				}
+				duration, execErr := executeWasm(ctx, dispatch.WasmBytes, executionData, w.Hooks, &outBuf, wasmArgs)
 
 				var errStr string
 				if execErr != nil {
@@ -202,4 +268,36 @@ func ensureLocalKeyPair() (string, error) {
 
 	fmt.Println("[SECURITY] New worker cryptographic keypair auto-generated and saved locally.")
 	return privHex, nil
+}
+
+// fetchURLFromHost executes a standard HTTP GET request with customized headers
+// to simulate a normal residential browser request.
+func fetchURLFromHost(targetURL string) (string, int, bool, error) {
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+	}
+	req, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil {
+		return "", 0, false, err
+	}
+	
+	// Add dynamic headers to look like a standard desktop browser
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Cache-Control", "max-age=0")
+	req.Header.Set("Connection", "keep-alive")
+	
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", 0, false, err
+	}
+	defer resp.Body.Close()
+	
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", resp.StatusCode, resp.StatusCode >= 200 && resp.StatusCode < 300, err
+	}
+	
+	return string(bodyBytes), resp.StatusCode, resp.StatusCode >= 200 && resp.StatusCode < 300, nil
 }
