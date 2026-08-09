@@ -43,6 +43,10 @@ func NewBroker() *Broker {
 		activeTasks: make(map[uint64]string),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
+				// Backend workers connect via WebSocket and do not carry browser Origin headers
+				if r.URL.Path == "/ws/worker" {
+					return true
+				}
 				allowedOrigin := os.Getenv("MESH_ALLOWED_ORIGIN")
 				if allowedOrigin == "" {
 					return true // Development mode
