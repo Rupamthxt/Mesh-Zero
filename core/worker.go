@@ -79,6 +79,13 @@ func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) erro
 		brokerAddr = "ws://localhost:8080"
 	}
 
+	// Sanitize common http/https copy-paste prefixes to ws/wss equivalents
+	if strings.HasPrefix(brokerAddr, "http://") {
+		brokerAddr = "ws://" + strings.TrimPrefix(brokerAddr, "http://")
+	} else if strings.HasPrefix(brokerAddr, "https://") {
+		brokerAddr = "wss://" + strings.TrimPrefix(brokerAddr, "https://")
+	}
+
 	if !strings.HasPrefix(brokerAddr, "ws://") && !strings.HasPrefix(brokerAddr, "wss://") {
 		if strings.HasPrefix(brokerAddr, "localhost") || strings.Contains(brokerAddr, "127.0.0.1") || strings.Contains(brokerAddr, ":") {
 			brokerAddr = "ws://" + brokerAddr
@@ -103,7 +110,11 @@ func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) erro
 			default:
 			}
 
-			conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+			// Inject ngrok bypass header to prevent browser warning redirects from blocking handshakes
+			header := make(http.Header)
+			header.Set("ngrok-skip-browser-warning", "true")
+
+			conn, _, err := websocket.DefaultDialer.Dial(u.String(), header)
 			if err != nil {
 				fmt.Printf("[WORKER] Connection failed: %v. Retrying in 5 seconds...\n", err)
 				time.Sleep(5 * time.Second)
