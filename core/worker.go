@@ -76,10 +76,22 @@ func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) erro
 
 	brokerAddr := os.Getenv("MESH_BROKER_ADDR")
 	if brokerAddr == "" {
-		brokerAddr = "localhost:8080" // default fallback
+		brokerAddr = "ws://localhost:8080"
 	}
 
-	u := url.URL{Scheme: "ws", Host: brokerAddr, Path: "/ws/worker"}
+	if !strings.HasPrefix(brokerAddr, "ws://") && !strings.HasPrefix(brokerAddr, "wss://") {
+		if strings.HasPrefix(brokerAddr, "localhost") || strings.Contains(brokerAddr, "127.0.0.1") || strings.Contains(brokerAddr, ":") {
+			brokerAddr = "ws://" + brokerAddr
+		} else {
+			brokerAddr = "wss://" + brokerAddr
+		}
+	}
+
+	u, err := url.Parse(brokerAddr)
+	if err != nil {
+		u = &url.URL{Scheme: "ws", Host: brokerAddr}
+	}
+	u.Path = "/ws/worker"
 	fmt.Printf("[WORKER] Connecting to Broker Gateway at %s...\n", u.String())
 
 	// Establish connection loop with retry backoff
