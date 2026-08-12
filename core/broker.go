@@ -333,7 +333,7 @@ func (b *Broker) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"task_id": taskID,
+		"task_id": fmt.Sprintf("%d", taskID),
 		"status":  "pending",
 	})
 }
@@ -403,7 +403,7 @@ func (b *Broker) handleTaskStatus(w http.ResponseWriter, r *http.Request) {
 	// Return status JSON
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"task_id":      t.ID,
+		"task_id":      fmt.Sprintf("%d", t.ID),
 		"status":       t.Status,
 		"stdout":       string(t.Stdout),
 		"receipt_json": t.ReceiptJSON,
@@ -913,7 +913,7 @@ func (b *Broker) handleTaskSubmitBatch(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":      "success",
-		"batch_id":    parentID,
+		"batch_id":    fmt.Sprintf("%d", parentID),
 		"tasks_count": len(inputs),
 		"message":     fmt.Sprintf("Batch job queued with %d parallel scraping tasks", len(inputs)),
 	})
@@ -1030,7 +1030,7 @@ func (b *Broker) handleTaskBatchStatus(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"batch_id":         parentID,
+		"batch_id":         fmt.Sprintf("%d", parentID),
 		"status":           status,
 		"progress_percent": progressPercent,
 		"tasks_total":      total,
