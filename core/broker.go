@@ -34,13 +34,21 @@ type Broker struct {
 	activeTasks   map[uint64]string // TaskID -> WorkerID
 	activeTasksMu sync.Mutex
 	upgrader      websocket.Upgrader
+
+	// Long-polling notifications
+	taskWaiters    map[uint64][]chan struct{}
+	taskWaitersMu  sync.Mutex
+	batchWaiters   map[int64][]chan struct{}
+	batchWaitersMu sync.Mutex
 }
 
 func NewBroker() *Broker {
 	b := &Broker{
-		workers:     make(map[string]*WorkerConnection),
-		taskQueue:   make(chan uint64, 1000),
-		activeTasks: make(map[uint64]string),
+		workers:      make(map[string]*WorkerConnection),
+		taskQueue:    make(chan uint64, 1000),
+		activeTasks:  make(map[uint64]string),
+		taskWaiters:  make(map[uint64][]chan struct{}),
+		batchWaiters: make(map[int64][]chan struct{}),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				// Backend workers connect via WebSocket and do not carry browser Origin headers
@@ -60,6 +68,29 @@ func NewBroker() *Broker {
 	go b.startScheduler()
 	return b
 }
+
+func (b *Broker) notifyTask(taskID uint64) {
+	b.taskWaitersMu.Lock()
+	defer b.taskWaitersMu.Unlock()
+	if chans, ok := b.taskWaiters[taskID]; ok {
+		for _, ch := range chans {
+			close(ch)
+		}
+		delete(b.taskWaiters, taskID)
+	}
+}
+
+func (b *Broker) notifyBatch(parentID int64) {
+	b.batchWaitersMu.Lock()
+	defer b.batchWaitersMu.Unlock()
+	if chans, ok := b.batchWaiters[parentID]; ok {
+		for _, ch := range chans {
+			close(ch)
+		}
+		delete(b.batchWaiters, parentID)
+	}
+}
+
 
 type RegisterPayload struct {
 	ID         string  `json:"id"`
@@ -168,25 +199,45 @@ func (b *Broker) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var resp TaskResponse
-		if err := json.Unmarshal(msgBytes, &resp); err == nil && resp.TaskID != 0 {
-			b.activeTasksMu.Lock()
-			delete(b.activeTasks, resp.TaskID)
-			b.activeTasksMu.Unlock()
+		if err := json.Unmarshal(msgBytes, &resp); err != nil {
+			fmt.Printf("[BROKER ERROR] Failed to unmarshal task response from worker: %v\n", err)
+			continue
+		}
+		if resp.TaskID == 0 {
+			continue
+		}
 
-			// Mark worker as idle
-			b.workersMu.Lock()
-			if w, ok := b.workers[reg.ID]; ok {
-				w.Busy = false
+		// Retrieve parentID before database update
+		var parentID int64
+		if tRec, dbErr := GetTaskDB(resp.TaskID); dbErr == nil {
+			parentID = tRec.ParentID
+		}
+
+		b.activeTasksMu.Lock()
+		delete(b.activeTasks, resp.TaskID)
+		b.activeTasksMu.Unlock()
+
+		// Mark worker as idle
+		b.workersMu.Lock()
+		if w, ok := b.workers[reg.ID]; ok {
+			w.Busy = false
+		}
+		b.workersMu.Unlock()
+
+		status := "completed"
+		if resp.Error != "" {
+			status = "failed"
+		}
+
+		// Update SQLite database with completion results
+		if err := UpdateTaskDB(resp.TaskID, status, resp.Stdout, resp.ReceiptJSON, resp.Error); err != nil {
+			fmt.Printf("[DATABASE ERROR] Failed to update task %d status: %v\n", resp.TaskID, err)
+		} else {
+			// Trigger long-polling notifications
+			b.notifyTask(resp.TaskID)
+			if parentID != 0 {
+				b.notifyBatch(parentID)
 			}
-			b.workersMu.Unlock()
-
-			status := "completed"
-			if resp.Error != "" {
-				status = "failed"
-			}
-
-			// Update SQLite database with completion results
-			_ = UpdateTaskDB(resp.TaskID, status, resp.Stdout, resp.ReceiptJSON, resp.Error)
 		}
 	}
 }
@@ -315,6 +366,40 @@ func (b *Broker) handleTaskStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Long-polling: If task is still executing/pending, wait for completion notification
+	if t.Status == "pending" || t.Status == "running" {
+		notifyChan := make(chan struct{})
+
+		b.taskWaitersMu.Lock()
+		b.taskWaiters[taskID] = append(b.taskWaiters[taskID], notifyChan)
+		b.taskWaitersMu.Unlock()
+
+		select {
+		case <-notifyChan:
+			// Task status changed! Refresh task record
+			if refreshed, err := GetTaskDB(taskID); err == nil {
+				t = refreshed
+			}
+		case <-time.After(20 * time.Second):
+			// Safe timeout to release HTTP connection; clean up listener channel
+			b.taskWaitersMu.Lock()
+			if waiters, ok := b.taskWaiters[taskID]; ok {
+				var newWaiters []chan struct{}
+				for _, ch := range waiters {
+					if ch != notifyChan {
+						newWaiters = append(newWaiters, ch)
+					}
+				}
+				if len(newWaiters) == 0 {
+					delete(b.taskWaiters, taskID)
+				} else {
+					b.taskWaiters[taskID] = newWaiters
+				}
+			}
+			b.taskWaitersMu.Unlock()
+		}
+	}
+
 	// Return status JSON
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -395,6 +480,10 @@ func (b *Broker) startScheduler() {
 			// Simple execution expiry timeout: if task is older than 30s, fail it
 			if time.Now().UnixNano()-t.CreatedAt > int64(30*time.Second) {
 				_ = UpdateTaskDB(taskID, "failed", nil, nil, "Task matching timed out: no suitable worker online")
+				b.notifyTask(taskID)
+				if t.ParentID != 0 {
+					b.notifyBatch(t.ParentID)
+				}
 				break
 			}
 		}
@@ -861,6 +950,49 @@ func (b *Broker) handleTaskBatchStatus(w http.ResponseWriter, r *http.Request) {
 	if total == 0 {
 		http.Error(w, "No tasks found for the specified batch ID", http.StatusNotFound)
 		return
+	}
+
+	// Count completed/failed tasks
+	finishedCount := 0
+	for _, rec := range records {
+		if rec.Status == "completed" || rec.Status == "failed" {
+			finishedCount++
+		}
+	}
+
+	// Long-polling: If batch is not yet finished, wait for updates
+	if finishedCount < total {
+		notifyChan := make(chan struct{})
+
+		b.batchWaitersMu.Lock()
+		b.batchWaiters[parentID] = append(b.batchWaiters[parentID], notifyChan)
+		b.batchWaitersMu.Unlock()
+
+		select {
+		case <-notifyChan:
+			// A subtask updated! Re-read from DB
+			if refreshed, err := GetBatchTasksDB(parentID); err == nil {
+				records = refreshed
+				total = len(records)
+			}
+		case <-time.After(20 * time.Second):
+			// Safe timeout to release connection; clean up listener channel
+			b.batchWaitersMu.Lock()
+			if waiters, ok := b.batchWaiters[parentID]; ok {
+				var newWaiters []chan struct{}
+				for _, ch := range waiters {
+					if ch != notifyChan {
+						newWaiters = append(newWaiters, ch)
+					}
+				}
+				if len(newWaiters) == 0 {
+					delete(b.batchWaiters, parentID)
+				} else {
+					b.batchWaiters[parentID] = newWaiters
+				}
+			}
+			b.batchWaitersMu.Unlock()
+		}
 	}
 
 	pendingCount := 0
