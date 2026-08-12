@@ -49,8 +49,8 @@ echo "🚀 3. Transferring assets to $SERVER_IP..."
 echo "-----------------------------------------"
 # Stop services before copying
 ssh $SSH_USER@$SERVER_IP "
-    systemctl stop mesh-zero || true
-    systemctl stop mesh-zero-web || true
+    systemctl stop mesh-zero >/dev/null 2>&1 || true
+    systemctl stop mesh-zero-web >/dev/null 2>&1 || true
     mkdir -p /var/lib/mesh-zero
     mkdir -p /var/lib/mesh-zero-web
 "
