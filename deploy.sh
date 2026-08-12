@@ -29,7 +29,7 @@ echo "✓ Compilation successful."
 echo "-----------------------------------------"
 echo "🚀 2. Transferring binary to $SERVER_IP..."
 echo "-----------------------------------------"
-ssh $SSH_USER@$SERVER_IP "mkdir -p /var/lib/mesh-zero"
+ssh $SSH_USER@$SERVER_IP "systemctl stop mesh-zero || true; mkdir -p /var/lib/mesh-zero"
 scp dist/mesh-zero-linux $SSH_USER@$SERVER_IP:/usr/local/bin/mesh-zero
 echo "✓ Transfer complete."
 
