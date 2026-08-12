@@ -36,6 +36,7 @@ if [ ! -d "$WEB_PATH" ]; then
 fi
 
 cd "$WEB_PATH"
+npm install
 npm run build
 cd -
 
