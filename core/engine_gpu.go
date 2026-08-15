@@ -24,7 +24,7 @@ func init() {
 }
 
 func registerGPUHook(ctx context.Context, r wazero.Runtime) error {
-	_, err := r.NewHostModuleBuilder("meshzero_gpu").
+	_, err := r.NewHostModuleBuilder("emdash_gpu").
 		NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, mod api.Module, shaderPtr, shaderLen, entryPtr, entryLen, dataPtr, dataLen, threadsPerGrid uint32) {
 			if dataLen == 0 || threadsPerGrid == 0 {

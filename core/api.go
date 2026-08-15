@@ -40,7 +40,7 @@ func (w *Worker) handleGetPeers(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	brokerAddr := os.Getenv("MESH_BROKER_ADDR")
+	brokerAddr := os.Getenv("EMDASH_BROKER_ADDR")
 	if brokerAddr == "" {
 		brokerAddr = "localhost:8080"
 	}
@@ -88,7 +88,7 @@ func (w *Worker) handleExecuteTask(res http.ResponseWriter, req *http.Request) {
 		var wasmPath string
 		switch templateID {
 		case "hasher":
-			wasmPath = "cmd/mesh-zero/hasher.wasm"
+			wasmPath = "cmd/emdash/hasher.wasm"
 		case "gpu_task":
 			wasmPath = "task/gpu_task.wasm"
 		default:
@@ -125,7 +125,7 @@ func (w *Worker) handleExecuteTask(res http.ResponseWriter, req *http.Request) {
 	defer dataFile.Close()
 	dataBytes, _ := io.ReadAll(dataFile)
 
-	brokerAddr := os.Getenv("MESH_BROKER_ADDR")
+	brokerAddr := os.Getenv("EMDASH_BROKER_ADDR")
 	if brokerAddr == "" {
 		brokerAddr = "localhost:8080"
 	}
@@ -185,7 +185,7 @@ func (w *Worker) handleGetStatus(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	brokerAddr := os.Getenv("MESH_BROKER_ADDR")
+	brokerAddr := os.Getenv("EMDASH_BROKER_ADDR")
 	if brokerAddr == "" {
 		brokerAddr = "localhost:8080"
 	}

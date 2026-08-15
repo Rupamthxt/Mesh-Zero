@@ -23,7 +23,7 @@ func InitDB() error {
 		return nil
 	}
 
-	db, err := sql.Open("sqlite", "mesh_zero.db")
+	db, err := sql.Open("sqlite", "emdash.db")
 	if err != nil {
 		return fmt.Errorf("failed to open sqlite db: %v", err)
 	}

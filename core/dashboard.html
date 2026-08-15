@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Mesh-Zero Control Plane</title>
+    <title>Emdash Control Plane</title>
     <!-- Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -307,7 +307,7 @@
 <body>
 
     <header>
-        <h1>Mesh-Zero Control Plane</h1>
+        <h1>Emdash Control Plane</h1>
         <div class="status-badge">
             <span class="status-dot"></span>
             Node Online
@@ -324,7 +324,7 @@
             <div class="stat-value" id="account-balance">$98.1651 USD</div>
         </div>
         <div class="stat-card">
-            <div class="stat-title">Local Mesh Discovery</div>
+            <div class="stat-title">Local Emdash Discovery</div>
             <div class="stat-value" id="peers-count-val">0 Nodes</div>
         </div>
     </div>
@@ -441,7 +441,7 @@
                         select.appendChild(opt);
                     });
                 } else {
-                    select.innerHTML = '<option value="">Searching for mesh nodes...</option>';
+                    select.innerHTML = '<option value="">Searching for emdash nodes...</option>';
                 }
             } catch (err) {
                 document.getElementById('node-id-val').innerText = "Disconnected";
@@ -528,7 +528,7 @@
                     }
                 }
             } catch (err) {
-                log.innerText += `\n[Fatal] Mesh transmission failed: ${err}`;
+                log.innerText += `\n[Fatal] Emdash transmission failed: ${err}`;
             } finally {
                 btn.innerText = "🚀 Blast Payload to Node";
                 btn.disabled = false;

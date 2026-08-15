@@ -55,7 +55,7 @@ func NewBroker() *Broker {
 				if r.URL.Path == "/ws/worker" {
 					return true
 				}
-				allowedOrigin := os.Getenv("MESH_ALLOWED_ORIGIN")
+				allowedOrigin := os.Getenv("EMDASH_ALLOWED_ORIGIN")
 				if allowedOrigin == "" {
 					return true // Development mode
 				}
@@ -284,7 +284,7 @@ func (b *Broker) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
 			var wasmPath string
 			switch templateID {
 			case "hasher":
-				wasmPath = "cmd/mesh-zero/hasher.wasm"
+				wasmPath = "cmd/emdash/hasher.wasm"
 			case "gpu_task":
 				wasmPath = "task/gpu_task.wasm"
 			}
@@ -780,12 +780,12 @@ func createStripeCheckoutSession(amount float64, accountID string) (string, erro
 	apiURL := "https://api.stripe.com/v1/checkout/sessions"
 	data := url.Values{}
 	data.Set("mode", "payment")
-	data.Set("success_url", "https://console.meshzero.network/console.html?session_id={CHECKOUT_SESSION_ID}&success=true")
-	data.Set("cancel_url", "https://console.meshzero.network/console.html?success=false")
+	data.Set("success_url", "https://emdash.world/console.html?session_id={CHECKOUT_SESSION_ID}&success=true")
+	data.Set("cancel_url", "https://emdash.world/console.html?success=false")
 	data.Set("line_items[0][price_data][currency]", "usd")
 	cents := int64(amount * 100)
 	data.Set("line_items[0][price_data][unit_amount]", fmt.Sprintf("%d", cents))
-	data.Set("line_items[0][price_data][product_data][name]", "MeshØ Compute Credits")
+	data.Set("line_items[0][price_data][product_data][name]", "Emdash Compute Credits")
 	data.Set("line_items[0][quantity]", "1")
 	data.Set("metadata[account_id]", accountID)
 	data.Set("metadata[amount]", fmt.Sprintf("%f", amount))

@@ -1,10 +1,10 @@
 #!/bin/bash
-# MeshØ DigitalOcean Automated Deployment Script (Unified Broker & Frontend)
+# Emdash DigitalOcean Automated Deployment Script (Unified Broker & Frontend)
 
 set -e
 
 echo "========================================="
-echo "   MeshØ DigitalOcean Unified Deployer   "
+echo "   Emdash DigitalOcean Unified Deployer   "
 echo "========================================="
 
 # Ask for server configuration if not set in environment
@@ -13,7 +13,7 @@ if [ -z "$SERVER_IP" ]; then
 fi
 
 if [ -z "$DOMAIN" ]; then
-    read -p "Enter your Domain Name (e.g. api.meshzero.network) [press Enter to use HTTP via IP only]: " DOMAIN
+    read -p "Enter your Domain Name (e.g. emdash.world) [press Enter to use HTTP via IP only]: " DOMAIN
 fi
 
 SSH_USER=${SSH_USER:-root}
@@ -23,7 +23,7 @@ echo "-----------------------------------------"
 echo "⚙️  1. Compiling Go Broker for Linux AMD64..."
 echo "-----------------------------------------"
 mkdir -p dist
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/mesh-zero-linux cmd/mesh-zero/main.go
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/emdash-linux cmd/emdash/main.go
 echo "✓ Go Broker compilation successful."
 
 echo "-----------------------------------------"
@@ -50,15 +50,15 @@ echo "🚀 3. Transferring assets to $SERVER_IP..."
 echo "-----------------------------------------"
 # Stop services before copying
 ssh $SSH_USER@$SERVER_IP "
-    systemctl stop mesh-zero >/dev/null 2>&1 || true
-    systemctl stop mesh-zero-web >/dev/null 2>&1 || true
-    mkdir -p /var/lib/mesh-zero
-    mkdir -p /var/lib/mesh-zero-web
+    systemctl stop emdash >/dev/null 2>&1 || true
+    systemctl stop emdash-web >/dev/null 2>&1 || true
+    mkdir -p /var/lib/emdash
+    mkdir -p /var/lib/emdash-web
 "
 
 # Copy Go binary and React build archive
-scp dist/mesh-zero-linux $SSH_USER@$SERVER_IP:/usr/local/bin/mesh-zero
-scp dist/web-build.tar.gz $SSH_USER@$SERVER_IP:/var/lib/mesh-zero-web/
+scp dist/emdash-linux $SSH_USER@$SERVER_IP:/usr/local/bin/emdash
+scp dist/web-build.tar.gz $SSH_USER@$SERVER_IP:/var/lib/emdash-web/
 echo "✓ Transfers complete."
 
 echo "-----------------------------------------"
@@ -66,7 +66,7 @@ echo "🔧 4. Configuring Remote Node.js & Services..."
 echo "-----------------------------------------"
 ssh $SSH_USER@$SERVER_IP "
     # Extract web assets
-    cd /var/lib/mesh-zero-web
+    cd /var/lib/emdash-web
     tar -xzf web-build.tar.gz
     rm web-build.tar.gz
 
@@ -78,16 +78,16 @@ ssh $SSH_USER@$SERVER_IP "
     fi
 
     # 1. Setup Go Broker Service
-    cat << 'EOF' > /etc/systemd/system/mesh-zero.service
+    cat << 'EOF' > /etc/systemd/system/emdash.service
 [Unit]
-Description=Mesh-Zero Central Broker
+Description=Emdash Central Broker
 After=network.target
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/var/lib/mesh-zero
-ExecStart=/usr/local/bin/mesh-zero broker start 8080
+WorkingDirectory=/var/lib/emdash
+ExecStart=/usr/local/bin/emdash broker start 8080
 Restart=always
 RestartSec=5
 Environment=PORT=8080
@@ -97,15 +97,15 @@ WantedBy=multi-user.target
 EOF
 
     # 2. Setup Node Web Frontend Service
-    cat << 'EOF' > /etc/systemd/system/mesh-zero-web.service
+    cat << 'EOF' > /etc/systemd/system/emdash-web.service
 [Unit]
-Description=Mesh-Zero React Web Frontend
+Description=Emdash React Web Frontend
 After=network.target
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/var/lib/mesh-zero-web
+WorkingDirectory=/var/lib/emdash-web
 ExecStart=/usr/bin/node .output/server/index.mjs
 Restart=always
 RestartSec=5
@@ -117,10 +117,10 @@ EOF
 
     # Reload systemd and start daemons
     systemctl daemon-reload
-    systemctl enable --now mesh-zero
-    systemctl enable --now mesh-zero-web
-    systemctl restart mesh-zero
-    systemctl restart mesh-zero-web
+    systemctl enable --now emdash
+    systemctl enable --now emdash-web
+    systemctl restart emdash
+    systemctl restart emdash-web
 "
 echo "✓ Services successfully configured and running."
 
@@ -160,7 +160,7 @@ EOF
 echo "✓ Caddy reverse proxy configured!"
 
 echo "========================================="
-echo "🎉 MeshØ Unified Platform Deployed! "
+echo "🎉 Emdash Unified Platform Deployed! "
 if [ -n "$DOMAIN" ]; then
     echo "Secure URL: https://$DOMAIN"
 else

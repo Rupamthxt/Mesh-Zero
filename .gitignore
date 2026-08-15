@@ -8,7 +8,7 @@ dist/
 *.db-shm
 *.db-wal
 *.db
-mesh-zero
-attick-worker
-mesh_worker.key
-mesh-zero-*
+/emdash
+/emdash-worker
+/emdash_worker.key
+/emdash-*

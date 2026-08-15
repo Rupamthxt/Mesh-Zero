@@ -17,7 +17,7 @@ func executeWasm(ctx context.Context, wasmBytes []byte, paramBytes []byte, hooks
 	startTime := time.Now()
 
 	timeoutSeconds := 5
-	if customTimeoutStr := os.Getenv("MESH_TASK_TIMEOUT"); customTimeoutStr != "" {
+	if customTimeoutStr := os.Getenv("EMDASH_TASK_TIMEOUT"); customTimeoutStr != "" {
 		if t, err := strconv.Atoi(customTimeoutStr); err == nil && t > 0 {
 			timeoutSeconds = t
 		}

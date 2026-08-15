@@ -1,4 +1,4 @@
-module github.com/rupamthxt/mesh-zero
+module github.com/rupamthxt/emdash
 
 go 1.25.7
 

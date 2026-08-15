@@ -50,7 +50,7 @@ var currentNodeCapabilities = NodeCapabilities{
 
 func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) error {
 	// Parse dynamic memory limit from environment variable (in Megabytes)
-	if ramStr := os.Getenv("MESH_MAX_RAM"); ramStr != "" {
+	if ramStr := os.Getenv("EMDASH_MAX_RAM"); ramStr != "" {
 		if ramMB, err := strconv.Atoi(ramStr); err == nil && ramMB > 0 {
 			currentNodeCapabilities.MaxRAm = uint64(ramMB) * 1024 * 1024
 		}
@@ -68,13 +68,13 @@ func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) erro
 	w.ID = hex.EncodeToString(pubKey)
 
 	fmt.Println("========================================")
-	fmt.Println(" MESH-ZERO LIGHTWEIGHT WORKER INITIALIZED")
+	fmt.Println("   EMDASH LIGHTWEIGHT WORKER INITIALIZED")
 	fmt.Printf("  Worker ID: %s\n", w.ID)
 	fmt.Printf("  GPU Accel: %v | Max RAM: %d MB\n", currentNodeCapabilities.HasGPU, currentNodeCapabilities.MaxRAm / (1024 * 1024))
 	fmt.Printf("  Pricing:   %.4f credits/ms\n", w.PricePerMs)
 	fmt.Println("========================================")
 
-	brokerAddr := os.Getenv("MESH_BROKER_ADDR")
+	brokerAddr := os.Getenv("EMDASH_BROKER_ADDR")
 	if brokerAddr == "" {
 		brokerAddr = "ws://localhost:8080"
 	}
@@ -206,7 +206,7 @@ globalThis.fetch = function(url) {
 			}
 		});
 	}
-	return Promise.reject(new Error("MeshØ Sandbox error: fetch is only allowed for the assigned __INPUT__ URL."));
+	return Promise.reject(new Error("Emdash Sandbox error: fetch is only allowed for the assigned __INPUT__ URL."));
 };
 `, escapedErr, isOk, statusCode, string(escapedBody), string(escapedBody))
 							
@@ -265,7 +265,7 @@ globalThis.fetch = function(url) {
 }
 
 func ensureLocalKeyPair() (string, error) {
-	keyFile := "mesh_worker.key"
+	keyFile := "emdash_worker.key"
 
 	// Try to read existing key
 	data, err := os.ReadFile(keyFile)

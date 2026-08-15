@@ -5,9 +5,9 @@ before:
     - go mod tidy
 
 builds:
-  - id: mesh-zero
-    main: ./cmd/mesh-zero/main.go
-    binary: mesh-zero
+  - id: emdash
+    main: ./cmd/emdash/main.go
+    binary: emdash
     env:
       - CGO_ENABLED=0 # Enforces your zero-infrastructure architecture
     goos:

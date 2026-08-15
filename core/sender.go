@@ -25,7 +25,7 @@ func RunSender(wasmPath, inputPath string, maxPrice float64) {
 		return
 	}
 
-	brokerAddr := os.Getenv("MESH_BROKER_ADDR")
+	brokerAddr := os.Getenv("EMDASH_BROKER_ADDR")
 	if brokerAddr == "" {
 		brokerAddr = "localhost:8080"
 	}
