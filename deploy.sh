@@ -29,7 +29,7 @@ echo "✓ Go Broker compilation successful."
 echo "-----------------------------------------"
 echo "⚛️  2. Building React Frontend (TanStack Start)..."
 echo "-----------------------------------------"
-WEB_PATH="/Users/rupamthxt/Projects/mesh-zero-web"
+WEB_PATH=${WEB_PATH:-"$(dirname "$PWD")/mesh-zero-web"}
 if [ ! -d "$WEB_PATH" ]; then
     echo "❌ Error: Web frontend source folder not found at $WEB_PATH"
     exit 1
