@@ -38,6 +38,8 @@ fi
 cd "$WEB_PATH"
 npm install
 npm run build
+# Remove developer console pages from production deployment output
+rm -f .output/public/console.html .output/public/host.html .output/public/app.js .output/public/host.js .output/public/style.css
 cd -
 
 echo "📦 Archiving compiled web assets..."
