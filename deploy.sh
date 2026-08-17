@@ -75,7 +75,7 @@ ssh $SSH_USER@$SERVER_IP "
     # Install Node.js if missing
     if ! command -v node &> /dev/null; then
         echo 'Node.js missing. Installing LTS Node.js...'
-        curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+        curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
         apt-get install -y nodejs
     fi
 
