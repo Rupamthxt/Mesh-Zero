@@ -110,8 +110,8 @@ User=root
 WorkingDirectory=/var/lib/emdash-web
 ExecStart=/usr/bin/node .output/server/index.mjs
 Restart=always
-RestartSec=5
 Environment=PORT=3000
+EnvironmentFile=-/var/lib/emdash-web/.env
 
 [Install]
 WantedBy=multi-user.target
