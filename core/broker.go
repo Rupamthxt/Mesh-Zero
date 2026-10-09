@@ -109,6 +109,11 @@ func (b *Broker) Start(port string) error {
 	mux.HandleFunc("/api/payouts/list", b.handlePayoutList)
 	mux.HandleFunc("/api/payouts/approve", b.handlePayoutApprove)
 
+	// API Keys Management
+	mux.HandleFunc("/api/keys/create", b.handleCreateAPIKey)
+	mux.HandleFunc("/api/keys/balance", b.handleGetAPIKeyBalance)
+	mux.HandleFunc("/api/keys", b.handleListAPIKeys)
+
 	// Health check
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -290,7 +295,18 @@ func (b *Broker) handleExtract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate target URL for safety compliance
+	// 1. Authenticate API Key and verify credit balance
+	apiKeyRec, authErr := AuthenticateAPIKey(r)
+	if authErr != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": fmt.Sprintf("Authentication failed: %v", authErr),
+		})
+		return
+	}
+
+	// 2. Validate target URL for safety compliance
 	if err := ValidateTargetURL(req.URL); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
@@ -322,20 +338,30 @@ func (b *Broker) handleExtract(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if t.Status == "completed" {
+			_ = DeductAPIKeyCreditDB(apiKeyRec.Key, 1.0)
+		}
+
 		var parsedData interface{}
 		if t.ResultJSON != "" {
 			_ = json.Unmarshal([]byte(t.ResultJSON), &parsedData)
 		}
 
+		remainingCredits := apiKeyRec.Credits
+		if t.Status == "completed" {
+			remainingCredits -= 1.0
+		}
+
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"task_id":      fmt.Sprintf("%d", t.ID),
-			"url":          t.URL,
-			"status":       t.Status,
-			"status_code":  t.StatusCode,
-			"latency_ms":   t.LatencyMs,
-			"data":         parsedData,
-			"receipt_json": t.ReceiptJSON,
-			"error":        t.Error,
+			"task_id":           fmt.Sprintf("%d", t.ID),
+			"url":               t.URL,
+			"status":            t.Status,
+			"status_code":       t.StatusCode,
+			"latency_ms":        t.LatencyMs,
+			"credits_remaining": remainingCredits,
+			"data":              parsedData,
+			"receipt_json":      t.ReceiptJSON,
+			"error":             t.Error,
 		})
 		return
 	}
@@ -773,3 +799,76 @@ func (b *Broker) handlePayoutApprove(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "success"})
 }
+
+func (b *Broker) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
+	if setupCORS(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	name := r.FormValue("name")
+	if name == "" {
+		name = "Developer Trial Key"
+	}
+	initialCredits := 1000.0
+	if cStr := r.FormValue("credits"); cStr != "" {
+		if c, err := strconv.ParseFloat(cStr, 64); err == nil && c > 0 {
+			initialCredits = c
+		}
+	}
+
+	key := GenerateAPIKey("emdash_live")
+	err := CreateAPIKeyDB(key, name, initialCredits)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create key: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "success",
+		"key":     key,
+		"name":    name,
+		"credits": initialCredits,
+		"message": "API key generated successfully. Provide via 'Authorization: Bearer <key>' or 'X-API-Key'",
+	})
+}
+
+func (b *Broker) handleGetAPIKeyBalance(w http.ResponseWriter, r *http.Request) {
+	if setupCORS(w, r) {
+		return
+	}
+	keyStr := ExtractAPIKey(r)
+	keyRec, err := GetAPIKeyDB(keyStr)
+	if err != nil {
+		http.Error(w, "API key not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"key":        keyRec.Key,
+		"name":       keyRec.Name,
+		"credits":    keyRec.Credits,
+		"is_active":  keyRec.IsActive,
+		"created_at": keyRec.CreatedAt,
+	})
+}
+
+func (b *Broker) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {
+	if setupCORS(w, r) {
+		return
+	}
+	keys, err := ListAPIKeysDB()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to list keys: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(keys)
+}
+

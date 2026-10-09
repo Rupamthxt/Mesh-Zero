@@ -60,6 +60,13 @@ func InitDB() error {
 			status TEXT NOT NULL,
 			created_at INTEGER NOT NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS api_keys (
+			key TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			credits REAL NOT NULL DEFAULT 1000.0,
+			created_at INTEGER NOT NULL,
+			is_active INTEGER NOT NULL DEFAULT 1
+		);`,
 	}
 
 	for _, query := range queries {
@@ -68,6 +75,12 @@ func InitDB() error {
 			return fmt.Errorf("migration failure: %v", err)
 		}
 	}
+
+	// Seed default trial demo API key if not present
+	_, _ = db.Exec(`
+		INSERT OR IGNORE INTO api_keys (key, name, credits, created_at, is_active)
+		VALUES ('emdash_trial_demo', 'Default Trial Playground Key', 1000.0, ?, 1)
+	`, time.Now().UnixNano())
 
 	dbInstance = db
 	fmt.Println("[DATABASE] SQLite database initialized successfully (WAL mode enabled).")
@@ -295,3 +308,79 @@ func UpdatePayoutRequestStatusDB(id int64, status string) error {
 	_, err := dbInstance.Exec("UPDATE payout_requests SET status = ? WHERE id = ?", status, id)
 	return err
 }
+
+type APIKeyRecord struct {
+	Key       string  `json:"key"`
+	Name      string  `json:"name"`
+	Credits   float64 `json:"credits"`
+	CreatedAt int64   `json:"created_at"`
+	IsActive  bool    `json:"is_active"`
+}
+
+// CreateAPIKeyDB inserts a new API key with initial credits
+func CreateAPIKeyDB(key, name string, initialCredits float64) error {
+	if dbInstance == nil {
+		return fmt.Errorf("db not initialized")
+	}
+	_, err := dbInstance.Exec(`
+		INSERT INTO api_keys (key, name, credits, created_at, is_active)
+		VALUES (?, ?, ?, ?, 1)
+	`, key, name, initialCredits, time.Now().UnixNano())
+	return err
+}
+
+// GetAPIKeyDB retrieves an API key by key string
+func GetAPIKeyDB(key string) (*APIKeyRecord, error) {
+	if dbInstance == nil {
+		return nil, fmt.Errorf("db not initialized")
+	}
+	var r APIKeyRecord
+	var isActiveInt int
+	err := dbInstance.QueryRow(`
+		SELECT key, name, credits, created_at, is_active
+		FROM api_keys WHERE key = ?
+	`, key).Scan(&r.Key, &r.Name, &r.Credits, &r.CreatedAt, &isActiveInt)
+	if err != nil {
+		return nil, err
+	}
+	r.IsActive = (isActiveInt == 1)
+	return &r, nil
+}
+
+// DeductAPIKeyCreditDB decrements an API key's balance by specified amount
+func DeductAPIKeyCreditDB(key string, amount float64) error {
+	if dbInstance == nil {
+		return fmt.Errorf("db not initialized")
+	}
+	_, err := dbInstance.Exec(`
+		UPDATE api_keys
+		SET credits = credits - ?
+		WHERE key = ? AND credits >= ?
+	`, amount, key, amount)
+	return err
+}
+
+// ListAPIKeysDB returns all registered API keys
+func ListAPIKeysDB() ([]APIKeyRecord, error) {
+	if dbInstance == nil {
+		return nil, fmt.Errorf("db not initialized")
+	}
+	rows, err := dbInstance.Query("SELECT key, name, credits, created_at, is_active FROM api_keys ORDER BY created_at DESC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var records []APIKeyRecord
+	for rows.Next() {
+		var r APIKeyRecord
+		var isActiveInt int
+		if err := rows.Scan(&r.Key, &r.Name, &r.Credits, &r.CreatedAt, &isActiveInt); err != nil {
+			return nil, err
+		}
+		r.IsActive = (isActiveInt == 1)
+		records = append(records, r)
+	}
+	return records, nil
+}
+

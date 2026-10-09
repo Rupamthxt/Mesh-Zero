@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  emdash-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: emdash-residential-node
+    restart: unless-stopped
+    environment:
+      - EMDASH_BROKER_ADDR=${EMDASH_BROKER_ADDR:-ws://host.docker.internal:8080}
+    network_mode: "host"

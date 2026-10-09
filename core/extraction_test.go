@@ -44,8 +44,10 @@ func TestSafetyValidator(t *testing.T) {
 func TestRateLimiter(t *testing.T) {
 	rl := NewRateLimiter(3) // Max 3 per minute
 
-	if !rl.Allow() || !rl.Allow() || !rl.Allow() {
-		t.Errorf("First 3 requests should be permitted")
+	for i := 0; i < 3; i++ {
+		if !rl.Allow() {
+			t.Fatalf("Request %d should have been permitted", i+1)
+		}
 	}
 
 	// 4th request must be rejected
@@ -173,5 +175,41 @@ func TestEndToEndExtraction(t *testing.T) {
 	valid, err := VerifyExtractionReceipt(receipt, worker.ID)
 	if err != nil || !valid {
 		t.Errorf("Receipt cryptographic verification failed: valid=%v, err=%v", valid, err)
+	}
+}
+
+func TestAPIKeyManagement(t *testing.T) {
+	_ = InitDB()
+
+	// 1. Check Default Demo Key
+	demoKey, err := GetAPIKeyDB("emdash_trial_demo")
+	if err != nil {
+		t.Fatalf("Default trial demo key not found: %v", err)
+	}
+	if demoKey.Credits < 100 {
+		t.Errorf("Expected at least 100 credits on demo key, got %.2f", demoKey.Credits)
+	}
+
+	// 2. Create custom trial key
+	customKey := GenerateAPIKey("emdash_trial")
+	err = CreateAPIKeyDB(customKey, "Test User Key", 50.0)
+	if err != nil {
+		t.Fatalf("Failed to create custom key: %v", err)
+	}
+
+	fetched, err := GetAPIKeyDB(customKey)
+	if err != nil || fetched.Credits != 50.0 {
+		t.Errorf("Failed to retrieve custom key or mismatched credits: %v", fetched)
+	}
+
+	// 3. Deduct credit
+	err = DeductAPIKeyCreditDB(customKey, 5.0)
+	if err != nil {
+		t.Fatalf("Failed to deduct credit: %v", err)
+	}
+
+	afterDeduct, _ := GetAPIKeyDB(customKey)
+	if afterDeduct.Credits != 45.0 {
+		t.Errorf("Expected 45.0 credits after deduction, got %.2f", afterDeduct.Credits)
 	}
 }
