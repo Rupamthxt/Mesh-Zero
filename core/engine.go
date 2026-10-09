@@ -13,10 +13,10 @@ import (
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 )
 
-func executeWasm(ctx context.Context, wasmBytes []byte, paramBytes []byte, hooks []ExtensionHook, out io.Writer, args []string) (time.Duration, error) {
+func executeWasm(ctx context.Context, wasmBytes []byte, paramBytes []byte, out io.Writer, args []string) (time.Duration, error) {
 	startTime := time.Now()
 
-	timeoutSeconds := 5
+	timeoutSeconds := 10
 	if customTimeoutStr := os.Getenv("EMDASH_TASK_TIMEOUT"); customTimeoutStr != "" {
 		if t, err := strconv.Atoi(customTimeoutStr); err == nil && t > 0 {
 			timeoutSeconds = t
@@ -28,20 +28,13 @@ func executeWasm(ctx context.Context, wasmBytes []byte, paramBytes []byte, hooks
 
 	pages := uint32(currentNodeCapabilities.MaxRAm / 65536)
 	if pages == 0 {
-		pages = 8192 // Fallback to 512MB (8192 pages)
+		pages = 8192 // Fallback to 512MB
 	}
 	config := wazero.NewRuntimeConfig().WithMemoryLimitPages(pages)
 	r := wazero.NewRuntimeWithConfig(ctx, config)
 	defer r.Close(timeoutCtx)
 
 	wasi_snapshot_preview1.MustInstantiate(ctx, r)
-
-	for _, hook := range hooks {
-		if err := hook(ctx, r); err != nil {
-			fmt.Fprintf(out, "Failed to load extension hook: %v\n", err)
-			return time.Since(startTime), err
-		}
-	}
 
 	compiledMod, err := r.CompileModule(timeoutCtx, wasmBytes)
 	if err != nil {
@@ -53,7 +46,7 @@ func executeWasm(ctx context.Context, wasmBytes []byte, paramBytes []byte, hooks
 		WithStdout(out).
 		WithStderr(out).
 		WithStdin(bytes.NewReader(paramBytes))
-	
+
 	if len(args) > 0 {
 		moduleConfig = moduleConfig.WithArgs(args...)
 	} else {
@@ -61,7 +54,6 @@ func executeWasm(ctx context.Context, wasmBytes []byte, paramBytes []byte, hooks
 	}
 
 	mod, err := r.InstantiateModule(timeoutCtx, compiledMod, moduleConfig)
-
 	if err != nil {
 		if timeoutCtx.Err() == context.DeadlineExceeded {
 			fmt.Fprintf(out, "[SYSTEM KILL] Task exceeded %d-second execution limit.\n", timeoutSeconds)

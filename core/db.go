@@ -39,15 +39,17 @@ func InitDB() error {
 			id TEXT PRIMARY KEY,
 			balance REAL NOT NULL
 		);`,
-		`CREATE TABLE IF NOT EXISTS tasks (
+		`CREATE TABLE IF NOT EXISTS extraction_tasks (
 			id INTEGER PRIMARY KEY,
-			wasm_bytes BLOB NOT NULL,
-			data_bytes BLOB NOT NULL,
+			url TEXT NOT NULL,
+			country TEXT,
+			extract_script TEXT,
 			status TEXT NOT NULL,
-			stdout BLOB,
+			status_code INTEGER DEFAULT 0,
+			latency_ms INTEGER DEFAULT 0,
+			result_json TEXT,
 			receipt_json TEXT,
 			error TEXT,
-			tier INTEGER NOT NULL,
 			created_at INTEGER NOT NULL,
 			parent_id INTEGER DEFAULT 0
 		);`,
@@ -66,9 +68,6 @@ func InitDB() error {
 			return fmt.Errorf("migration failure: %v", err)
 		}
 	}
-
-	// Schema migration fallback: add parent_id if table already exists
-	_, _ = db.Exec("ALTER TABLE tasks ADD COLUMN parent_id INTEGER DEFAULT 0;")
 
 	dbInstance = db
 	fmt.Println("[DATABASE] SQLite database initialized successfully (WAL mode enabled).")
@@ -93,7 +92,6 @@ func GetBalanceDB(id string) float64 {
 	var bal float64
 	err := dbInstance.QueryRow("SELECT balance FROM balances WHERE id = ?", id).Scan(&bal)
 	if err == sql.ErrNoRows {
-		// Auto-initialize balance to 100.0 for new users in prototype
 		_ = SetBalanceDB(id, 100.0)
 		return 100.0
 	}
@@ -116,77 +114,83 @@ func SetBalanceDB(id string, bal float64) error {
 	return err
 }
 
-// CreateTaskDB inserts a new task record in pending state
-func CreateTaskDB(id uint64, wasmBytes []byte, dataBytes []byte, tier int) error {
-	return CreateTaskDBWithParent(id, wasmBytes, dataBytes, tier, 0)
-}
-
-// CreateTaskDBWithParent inserts a new task record with a batch parent ID
-func CreateTaskDBWithParent(id uint64, wasmBytes []byte, dataBytes []byte, tier int, parentID int64) error {
-	if dbInstance == nil {
-		return fmt.Errorf("db not initialized")
-	}
-	_, err := dbInstance.Exec(`
-		INSERT INTO tasks (id, wasm_bytes, data_bytes, status, tier, created_at, parent_id)
-		VALUES (?, ?, ?, 'pending', ?, ?, ?)
-	`, id, wasmBytes, dataBytes, tier, time.Now().UnixNano(), parentID)
-	return err
-}
-
-// UpdateTaskDB updates a task record with result data and status
-func UpdateTaskDB(id uint64, status string, stdout []byte, receiptJSON []byte, errStr string) error {
-	if dbInstance == nil {
-		return fmt.Errorf("db not initialized")
-	}
-	var receipt interface{}
-	if len(receiptJSON) > 0 {
-		receipt = string(receiptJSON)
-	}
-
-	_, err := dbInstance.Exec(`
-		UPDATE tasks 
-		SET status = ?, stdout = ?, receipt_json = ?, error = ?
-		WHERE id = ?
-	`, status, stdout, receipt, errStr, id)
-	return err
-}
-
 type TaskRecord struct {
-	ID          uint64
-	WasmBytes   []byte
-	DataBytes   []byte
-	Status      string
-	Stdout      []byte
-	ReceiptJSON string
-	Error       string
-	Tier        int
-	CreatedAt   int64
-	ParentID    int64
+	ID            uint64 `json:"id"`
+	URL           string `json:"url"`
+	Country       string `json:"country"`
+	ExtractScript string `json:"extract_script"`
+	Status        string `json:"status"`
+	StatusCode    int    `json:"status_code"`
+	LatencyMs     int64  `json:"latency_ms"`
+	ResultJSON    string `json:"result_json"`
+	ReceiptJSON   string `json:"receipt_json"`
+	Error         string `json:"error"`
+	CreatedAt     int64  `json:"created_at"`
+	ParentID      int64  `json:"parent_id"`
 }
 
-// GetTaskDB fetches a task record by ID
+// CreateTaskDB inserts a new extraction task record in pending state
+func CreateTaskDB(id uint64, targetURL, country, extractScript string, parentID int64) error {
+	if dbInstance == nil {
+		return fmt.Errorf("db not initialized")
+	}
+	_, err := dbInstance.Exec(`
+		INSERT INTO extraction_tasks (id, url, country, extract_script, status, created_at, parent_id)
+		VALUES (?, ?, ?, ?, 'pending', ?, ?)
+	`, id, targetURL, country, extractScript, time.Now().UnixNano(), parentID)
+	return err
+}
+
+// UpdateTaskDB updates a task record with extracted results
+func UpdateTaskDB(id uint64, status string, statusCode int, latencyMs int64, resultJSON []byte, receiptJSON []byte, errStr string) error {
+	if dbInstance == nil {
+		return fmt.Errorf("db not initialized")
+	}
+	var resStr, receiptStr string
+	if len(resultJSON) > 0 {
+		resStr = string(resultJSON)
+	}
+	if len(receiptJSON) > 0 {
+		receiptStr = string(receiptJSON)
+	}
+
+	_, err := dbInstance.Exec(`
+		UPDATE extraction_tasks 
+		SET status = ?, status_code = ?, latency_ms = ?, result_json = ?, receipt_json = ?, error = ?
+		WHERE id = ?
+	`, status, statusCode, latencyMs, resStr, receiptStr, errStr, id)
+	return err
+}
+
+// GetTaskDB fetches an extraction task record by ID
 func GetTaskDB(id uint64) (*TaskRecord, error) {
 	if dbInstance == nil {
 		return nil, fmt.Errorf("db not initialized")
 	}
 
 	var t TaskRecord
-	var stdout []byte
-	var receipt sql.NullString
-	var errStr sql.NullString
+	var resJSON, receiptJSON, errStr, country, extractScript sql.NullString
 
 	err := dbInstance.QueryRow(`
-		SELECT id, wasm_bytes, data_bytes, status, stdout, receipt_json, error, tier, created_at, parent_id
-		FROM tasks WHERE id = ?
-	`, id).Scan(&t.ID, &t.WasmBytes, &t.DataBytes, &t.Status, &stdout, &receipt, &errStr, &t.Tier, &t.CreatedAt, &t.ParentID)
+		SELECT id, url, country, extract_script, status, status_code, latency_ms, result_json, receipt_json, error, created_at, parent_id
+		FROM extraction_tasks WHERE id = ?
+	`, id).Scan(&t.ID, &t.URL, &country, &extractScript, &t.Status, &t.StatusCode, &t.LatencyMs, &resJSON, &receiptJSON, &errStr, &t.CreatedAt, &t.ParentID)
 
 	if err != nil {
 		return nil, err
 	}
 
-	t.Stdout = stdout
-	if receipt.Valid {
-		t.ReceiptJSON = receipt.String
+	if country.Valid {
+		t.Country = country.String
+	}
+	if extractScript.Valid {
+		t.ExtractScript = extractScript.String
+	}
+	if resJSON.Valid {
+		t.ResultJSON = resJSON.String
+	}
+	if receiptJSON.Valid {
+		t.ReceiptJSON = receiptJSON.String
 	}
 	if errStr.Valid {
 		t.Error = errStr.String
@@ -202,8 +206,8 @@ func GetBatchTasksDB(parentID int64) ([]TaskRecord, error) {
 	}
 
 	rows, err := dbInstance.Query(`
-		SELECT id, wasm_bytes, data_bytes, status, stdout, receipt_json, error, tier, created_at, parent_id
-		FROM tasks WHERE parent_id = ?
+		SELECT id, url, country, extract_script, status, status_code, latency_ms, result_json, receipt_json, error, created_at, parent_id
+		FROM extraction_tasks WHERE parent_id = ?
 	`, parentID)
 	if err != nil {
 		return nil, err
@@ -213,18 +217,24 @@ func GetBatchTasksDB(parentID int64) ([]TaskRecord, error) {
 	var records []TaskRecord
 	for rows.Next() {
 		var t TaskRecord
-		var stdout []byte
-		var receipt sql.NullString
-		var errStr sql.NullString
+		var resJSON, receiptJSON, errStr, country, extractScript sql.NullString
 
-		err := rows.Scan(&t.ID, &t.WasmBytes, &t.DataBytes, &t.Status, &stdout, &receipt, &errStr, &t.Tier, &t.CreatedAt, &t.ParentID)
+		err := rows.Scan(&t.ID, &t.URL, &country, &extractScript, &t.Status, &t.StatusCode, &t.LatencyMs, &resJSON, &receiptJSON, &errStr, &t.CreatedAt, &t.ParentID)
 		if err != nil {
 			return nil, err
 		}
 
-		t.Stdout = stdout
-		if receipt.Valid {
-			t.ReceiptJSON = receipt.String
+		if country.Valid {
+			t.Country = country.String
+		}
+		if extractScript.Valid {
+			t.ExtractScript = extractScript.String
+		}
+		if resJSON.Valid {
+			t.ResultJSON = resJSON.String
+		}
+		if receiptJSON.Valid {
+			t.ReceiptJSON = receiptJSON.String
 		}
 		if errStr.Valid {
 			t.Error = errStr.String

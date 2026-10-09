@@ -7,55 +7,48 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
-	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
-	quickjswasi "github.com/paralin/go-quickjs-wasi"
-	"github.com/tetratelabs/wazero"
 )
-
-type ExtensionHook func(context.Context, wazero.Runtime) error
-
-var DefaultHooks []ExtensionHook
 
 type Worker struct {
 	ID            string
-	PricePerMs    float64
+	PricePerTask  float64
 	PrivateKeyHex string
-	Hooks         []ExtensionHook
+	Geo           NodeGeoInfo
+	RateLimiter   *RateLimiter
 }
 
 type NodeCapabilities struct {
-	HasGPU       bool
-	MaxRAm       uint64
-	IsMobile     bool
-	SupportsWASI bool
+	MaxRAm uint64
 }
 
 var currentNodeCapabilities = NodeCapabilities{
-	HasGPU:       false,
-	MaxRAm:       512 * 1024 * 1024, // 512MB RAM limit for tasks
-	IsMobile:     false,
-	SupportsWASI: true,
+	MaxRAm: 512 * 1024 * 1024,
 }
 
+type TaskDispatch struct {
+	TaskID        uint64 `json:"task_id"`
+	URL           string `json:"url"`
+	ExtractScript string `json:"extract_script,omitempty"`
+	TimeoutSec    int    `json:"timeout_sec,omitempty"`
+}
 
+type TaskResponse struct {
+	TaskID      uint64 `json:"task_id"`
+	StatusCode  int    `json:"status_code"`
+	LatencyMs   int64  `json:"latency_ms"`
+	ResultJSON  []byte `json:"result_json"`
+	ReceiptJSON []byte `json:"receipt_json"`
+	Error       string `json:"error,omitempty"`
+}
 
 func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) error {
-	// Parse dynamic memory limit from environment variable (in Megabytes)
-	if ramStr := os.Getenv("EMDASH_MAX_RAM"); ramStr != "" {
-		if ramMB, err := strconv.Atoi(ramStr); err == nil && ramMB > 0 {
-			currentNodeCapabilities.MaxRAm = uint64(ramMB) * 1024 * 1024
-		}
-	}
-
 	privKeyHex, err := ensureLocalKeyPair()
 	if err != nil {
 		return fmt.Errorf("failed to load/generate worker key: %v", err)
@@ -67,25 +60,34 @@ func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) erro
 	pubKey := privKey.Public().(ed25519.PublicKey)
 	w.ID = hex.EncodeToString(pubKey)
 
-	fmt.Println("========================================")
-	fmt.Println("   EMDASH LIGHTWEIGHT WORKER INITIALIZED")
-	fmt.Printf("  Worker ID: %s\n", w.ID)
-	fmt.Printf("  GPU Accel: %v | Max RAM: %d MB\n", currentNodeCapabilities.HasGPU, currentNodeCapabilities.MaxRAm / (1024 * 1024))
-	fmt.Printf("  Pricing:   %.4f credits/ms\n", w.PricePerMs)
-	fmt.Println("========================================")
+	// Discover host public network characteristics and geolocation
+	fmt.Println("[NETWORK] Discovering residential host identity & geolocation...")
+	w.Geo = DiscoverNodeGeo()
+	w.RateLimiter = NewRateLimiter(12) // Default max 12 requests/min to protect host bandwidth
+
+	if w.PricePerTask <= 0 {
+		w.PricePerTask = 1.0 // 1 credit per extraction by default
+	}
+
+	fmt.Println("==================================================")
+	fmt.Println("     EMDASH RESIDENTIAL EXTRACTION NODE")
+	fmt.Printf("  Node ID:     %s\n", w.ID[:16]+"...")
+	fmt.Printf("  Location:    %s, %s (%s)\n", w.Geo.City, w.Geo.Country, w.Geo.CountryCode)
+	fmt.Printf("  Public IP:   %s via %s\n", w.Geo.IP, w.Geo.ISP)
+	fmt.Printf("  Rate Limit:  Max 12 requests/min (Host Protection Active)\n")
+	fmt.Printf("  Pricing:     %.2f credits/page\n", w.PricePerTask)
+	fmt.Println("==================================================")
 
 	brokerAddr := os.Getenv("EMDASH_BROKER_ADDR")
 	if brokerAddr == "" {
 		brokerAddr = "ws://localhost:8080"
 	}
 
-	// Sanitize common http/https copy-paste prefixes to ws/wss equivalents
 	if strings.HasPrefix(brokerAddr, "http://") {
 		brokerAddr = "ws://" + strings.TrimPrefix(brokerAddr, "http://")
 	} else if strings.HasPrefix(brokerAddr, "https://") {
 		brokerAddr = "wss://" + strings.TrimPrefix(brokerAddr, "https://")
 	}
-
 	if !strings.HasPrefix(brokerAddr, "ws://") && !strings.HasPrefix(brokerAddr, "wss://") {
 		if strings.HasPrefix(brokerAddr, "localhost") || strings.Contains(brokerAddr, "127.0.0.1") || strings.Contains(brokerAddr, ":") {
 			brokerAddr = "ws://" + brokerAddr
@@ -99,7 +101,7 @@ func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) erro
 		u = &url.URL{Scheme: "ws", Host: brokerAddr}
 	}
 	u.Path = "/ws/worker"
-	fmt.Printf("[WORKER] Connecting to Broker Gateway at %s...\n", u.String())
+	fmt.Printf("[WORKER] Connecting to Central Gateway at %s...\n", u.String())
 
 	// Establish connection loop with retry backoff
 	go func() {
@@ -110,7 +112,6 @@ func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) erro
 			default:
 			}
 
-			// Inject ngrok bypass header to prevent browser warning redirects from blocking handshakes
 			header := make(http.Header)
 			header.Set("ngrok-skip-browser-warning", "true")
 
@@ -121,26 +122,22 @@ func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) erro
 				continue
 			}
 
-			// Determine hardware tier: 1 = GPU/High-end, 2 = Desktop (Standard), 3 = Mobile/IoT
-			tier := 2
-			if currentNodeCapabilities.HasGPU {
-				tier = 1
-			} else if currentNodeCapabilities.IsMobile {
-				tier = 3
-			}
-
-			// 1. Register with broker
+			// 1. Register with broker with geolocation and capabilities
 			reg := map[string]interface{}{
-				"id":           w.ID,
-				"price_per_ms": w.PricePerMs,
-				"tier":         tier,
+				"id":             w.ID,
+				"ip":             w.Geo.IP,
+				"country":        w.Geo.Country,
+				"country_code":   w.Geo.CountryCode,
+				"city":           w.Geo.City,
+				"isp":            w.Geo.ISP,
+				"price_per_task": w.PricePerTask,
 			}
 			regBytes, _ := json.Marshal(reg)
 			_ = conn.WriteMessage(websocket.TextMessage, regBytes)
 
 			fmt.Println("[WORKER] Successfully connected and registered with Central Broker!")
 
-			// 2. Loop and read tasks
+			// 2. Loop and process incoming extraction tasks
 			for {
 				_, message, err := conn.ReadMessage()
 				if err != nil {
@@ -153,87 +150,48 @@ func (w *Worker) Start(ctx context.Context, enableApi bool, apiPort string) erro
 					continue
 				}
 
-				fmt.Printf("[WORKER] Executing Task %d via Broker...\n", dispatch.TaskID)
-				
-				// Execute WASM sandbox in memory
-				var outBuf bytes.Buffer
-				var wasmArgs []string
-				var executionData = dispatch.DataBytes
+				fmt.Printf("[WORKER] Processing Extraction Job #%d -> %s\n", dispatch.TaskID, dispatch.URL)
 
-				if bytes.Equal(dispatch.WasmBytes, quickjswasi.QuickJSWASM) {
-					jsCode := string(dispatch.DataBytes)
-					
-					// Detect if this is a residential web scraping request
-					reInput := regexp.MustCompile(`const\s+__INPUT__\s*=\s*["']([^"']+)["'];`)
-					match := reInput.FindStringSubmatch(jsCode)
-					if len(match) > 1 {
-						targetURL := match[1]
-						if strings.HasPrefix(targetURL, "http://") || strings.HasPrefix(targetURL, "https://") {
-							fmt.Printf("[WORKER] Residential Scraper: Pre-fetching URL: %s\n", targetURL)
-							
-							// Fetch the content natively on the host using worker's residential IP
-							fetchedBody, statusCode, isOk, fetchErr := fetchURLFromHost(targetURL)
-							
-							var errStr string
-							if fetchErr != nil {
-								errStr = fetchErr.Error()
-								fmt.Printf("[WORKER] Pre-fetch failed: %v\n", fetchErr)
-							} else {
-								fmt.Printf("[WORKER] Pre-fetch complete. Size: %d bytes | Status: %d\n", len(fetchedBody), statusCode)
-							}
-							
-							escapedBody, _ := json.Marshal(fetchedBody)
-							escapedErr, _ := json.Marshal(errStr)
-							
-							// Prepend the fetch polyfill to override globalThis.fetch inside QuickJS
-							polyfill := fmt.Sprintf(`
-globalThis.fetch = function(url) {
-	if (url === __INPUT__) {
-		const errStr = %s;
-		if (errStr) {
-			return Promise.reject(new Error(errStr));
-		}
-		return Promise.resolve({
-			ok: %t,
-			status: %d,
-			text: () => Promise.resolve(%s),
-			json: () => {
-				try {
-					return Promise.resolve(JSON.parse(%s));
-				} catch (e) {
-					return Promise.reject(e);
-				}
-			}
-		});
-	}
-	return Promise.reject(new Error("Emdash Sandbox error: fetch is only allowed for the assigned __INPUT__ URL."));
-};
-`, escapedErr, isOk, statusCode, string(escapedBody), string(escapedBody))
-							
-							// Prepend polyfill after the __INPUT__ definition
-							newLineIdx := strings.Index(jsCode, "\n")
-							if newLineIdx != -1 {
-								jsCode = jsCode[:newLineIdx+1] + polyfill + jsCode[newLineIdx+1:]
-							} else {
-								jsCode = polyfill + jsCode
-							}
-							
-							executionData = []byte(jsCode)
-						}
+				// Rate limiting host check
+				if !w.RateLimiter.Allow() {
+					fmt.Println("[WORKER] Rate limit exceeded; rejecting task to protect host")
+					resp := TaskResponse{
+						TaskID: dispatch.TaskID,
+						Error:  "Worker host rate limit reached; job throttled for safety",
 					}
-					wasmArgs = []string{"qjs", "-e", string(executionData)}
+					respMsg, _ := json.Marshal(resp)
+					_ = conn.WriteMessage(websocket.TextMessage, respMsg)
+					continue
 				}
-				duration, execErr := executeWasm(ctx, dispatch.WasmBytes, executionData, w.Hooks, &outBuf, wasmArgs)
+
+				// Fetch URL natively with residential browser headers
+				fetchRes, fetchErr := FetchResidentialURL(ctx, dispatch.URL, dispatch.TimeoutSec)
+				if fetchErr != nil {
+					fmt.Printf("[WORKER] Fetch failed: %v\n", fetchErr)
+					resp := TaskResponse{
+						TaskID: dispatch.TaskID,
+						Error:  fmt.Sprintf("Residential fetch failed: %v", fetchErr),
+					}
+					respMsg, _ := json.Marshal(resp)
+					_ = conn.WriteMessage(websocket.TextMessage, respMsg)
+					continue
+				}
+
+				// Execute sandboxed extraction script inside QuickJS WASI
+				preparedJS := PrepareExtractionScript(dispatch.URL, fetchRes.Body, fetchRes.StatusCode, dispatch.ExtractScript)
+				extractedJSON, execErr := ExecuteExtractionSandbox(ctx, preparedJS)
 
 				var errStr string
 				if execErr != nil {
 					errStr = execErr.Error()
+					fmt.Printf("[WORKER] Extraction error: %v\n", execErr)
+				} else {
+					fmt.Printf("[WORKER] Extraction successful (%d bytes JSON extracted in %dms)\n", len(extractedJSON), fetchRes.LatencyMs)
 				}
 
-				// Generate receipt using auto-initialized worker key
-				execTimeMs := float64(duration.Nanoseconds()) / 1e6
+				// Generate signed receipt
 				var receiptJSON []byte
-				receipt, err := GenerateReceipt(dispatch.TaskID, w.ID, execTimeMs, w.PricePerMs, w.PrivateKeyHex)
+				receipt, err := GenerateExtractionReceipt(dispatch.TaskID, w.ID, dispatch.URL, fetchRes.StatusCode, len(extractedJSON), w.PricePerTask, w.PrivateKeyHex)
 				if err == nil {
 					receiptJSON, _ = json.Marshal(receipt)
 				}
@@ -241,21 +199,21 @@ globalThis.fetch = function(url) {
 				// Send result back to Broker
 				resp := TaskResponse{
 					TaskID:      dispatch.TaskID,
-					Stdout:      outBuf.Bytes(),
+					StatusCode:  fetchRes.StatusCode,
+					LatencyMs:   fetchRes.LatencyMs,
+					ResultJSON:  extractedJSON,
 					ReceiptJSON: receiptJSON,
 					Error:       errStr,
 				}
 
 				respMsg, _ := json.Marshal(resp)
 				_ = conn.WriteMessage(websocket.TextMessage, respMsg)
-				fmt.Printf("[WORKER] Finished Task %d. Duration: %.2fms | Cost: %.6f credits\n", dispatch.TaskID, execTimeMs, receipt.TotalPrice)
 			}
 
 			time.Sleep(2 * time.Second)
 		}
 	}()
 
-	// Start local API server/dashboard if enabled
 	if enableApi {
 		go w.StartAPIServer(apiPort)
 	}
@@ -267,16 +225,14 @@ globalThis.fetch = function(url) {
 func ensureLocalKeyPair() (string, error) {
 	keyFile := "emdash_worker.key"
 
-	// Try to read existing key
 	data, err := os.ReadFile(keyFile)
 	if err == nil {
 		privKeyHex := string(bytes.TrimSpace(data))
-		if len(privKeyHex) == 128 { // 64 bytes in hex is 128 characters
+		if len(privKeyHex) == 128 {
 			return privKeyHex, nil
 		}
 	}
 
-	// Generate new keypair
 	pub, priv, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		return "", err
@@ -291,36 +247,4 @@ func ensureLocalKeyPair() (string, error) {
 
 	fmt.Println("[SECURITY] New worker cryptographic keypair auto-generated and saved locally.")
 	return privHex, nil
-}
-
-// fetchURLFromHost executes a standard HTTP GET request with customized headers
-// to simulate a normal residential browser request.
-func fetchURLFromHost(targetURL string) (string, int, bool, error) {
-	client := &http.Client{
-		Timeout: 15 * time.Second,
-	}
-	req, err := http.NewRequest("GET", targetURL, nil)
-	if err != nil {
-		return "", 0, false, err
-	}
-	
-	// Add dynamic headers to look like a standard desktop browser
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Cache-Control", "max-age=0")
-	req.Header.Set("Connection", "keep-alive")
-	
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", 0, false, err
-	}
-	defer resp.Body.Close()
-	
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", resp.StatusCode, resp.StatusCode >= 200 && resp.StatusCode < 300, err
-	}
-	
-	return string(bodyBytes), resp.StatusCode, resp.StatusCode >= 200 && resp.StatusCode < 300, nil
 }

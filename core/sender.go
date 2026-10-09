@@ -5,175 +5,121 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"mime/multipart"
 	"net/http"
 	"os"
 	"time"
 )
 
-func RunSender(wasmPath, inputPath string, maxPrice float64) {
-	// Read input files
-	wasmBytes, err := os.ReadFile(wasmPath)
-	if err != nil {
-		fmt.Printf("FATAL: Could not read WASM file: %v\n", err)
-		return
-	}
-
-	dataBytes, err := os.ReadFile(inputPath)
-	if err != nil {
-		fmt.Printf("FATAL: Could not read data file: %v\n", err)
-		return
-	}
-
+// RunExtract submits an extraction job from the CLI to the Central Broker
+func RunExtract(targetURL, country, scriptPath string) {
 	brokerAddr := os.Getenv("EMDASH_BROKER_ADDR")
 	if brokerAddr == "" {
 		brokerAddr = "localhost:8080"
 	}
 
-	fmt.Printf("[CLIENT] Sending task payload to Central Broker at %s...\n", brokerAddr)
-
-	// Create multipart request
-	bodyBuf := &bytes.Buffer{}
-	mw := multipart.NewWriter(bodyBuf)
-
-	// Attach data
-	dataPart, err := mw.CreateFormFile("data", "data.txt")
-	if err != nil {
-		fmt.Printf("FATAL: Failed to package data: %v\n", err)
-		return
+	var customScript string
+	if scriptPath != "" {
+		data, err := os.ReadFile(scriptPath)
+		if err != nil {
+			fmt.Printf("ERROR: Could not read script file: %v\n", err)
+			return
+		}
+		customScript = string(data)
 	}
-	dataPart.Write(dataBytes)
 
-	// Attach wasm
-	wasmPart, err := mw.CreateFormFile("wasm", "task.wasm")
-	if err != nil {
-		fmt.Printf("FATAL: Failed to package WASM: %v\n", err)
-		return
+	fmt.Printf("[CLIENT] Requesting residential extraction for: %s\n", targetURL)
+	if country != "" {
+		fmt.Printf("[CLIENT] Target Country Preference: %s\n", country)
 	}
-	wasmPart.Write(wasmBytes)
 
-	// Attach budget constraint
-	mw.WriteField("max_price", fmt.Sprintf("%f", maxPrice))
+	payload := map[string]interface{}{
+		"url":            targetURL,
+		"country":        country,
+		"extract_script": customScript,
+	}
+	bodyBytes, _ := json.Marshal(payload)
 
-	mw.Close()
-
-	brokerURL := fmt.Sprintf("http://%s/api/tasks/submit", brokerAddr)
-	req, err := http.NewRequest("POST", brokerURL, bodyBuf)
+	reqURL := fmt.Sprintf("http://%s/api/extract", brokerAddr)
+	req, err := http.NewRequest("POST", reqURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		fmt.Printf("FATAL: Failed to build request: %v\n", err)
 		return
 	}
-	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: 35 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Printf("FATAL: Failed to connect to Broker: %v\n", err)
+		fmt.Printf("FATAL: Failed to contact Central Broker: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusAccepted {
-		respBytes, _ := io.ReadAll(resp.Body)
-		fmt.Printf("ERROR: Task submission rejected by broker: %s\n", string(respBytes))
+	if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusOK {
+		errBytes, _ := io.ReadAll(resp.Body)
+		fmt.Printf("ERROR: Submission rejected: %s\n", string(errBytes))
 		return
 	}
 
 	var submitResp struct {
-		TaskID uint64 `json:"task_id"`
+		TaskID string `json:"task_id"`
 		Status string `json:"status"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&submitResp); err != nil {
-		fmt.Printf("ERROR: Failed to parse submission response: %v\n", err)
-		return
-	}
+	_ = json.NewDecoder(resp.Body).Decode(&submitResp)
 
-	fmt.Printf("[CLIENT] Task queued. TaskID: %d. Waiting for execution...\n", submitResp.TaskID)
+	fmt.Printf("[CLIENT] Job queued (Task ID: %s). Waiting for residential node execution...\n", submitResp.TaskID)
 
-	// Start polling the status endpoint
-	statusURL := fmt.Sprintf("http://%s/api/tasks/status?id=%d", brokerAddr, submitResp.TaskID)
-	var taskStdout string
-	var receiptJSON string
-	var taskErr string
-
+	// Poll status
+	statusURL := fmt.Sprintf("http://%s/api/extract/status?id=%s", brokerAddr, submitResp.TaskID)
 	for {
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(1 * time.Second)
 
-		statusResp, err := http.Get(statusURL)
+		sResp, err := http.Get(statusURL)
 		if err != nil {
-			fmt.Printf("ERROR: Failed to poll task status: %v\n", err)
-			return
+			continue
 		}
 
 		var s struct {
-			Status      string `json:"status"`
-			Stdout      string `json:"stdout"`
-			ReceiptJSON string `json:"receipt_json"`
-			Error       string `json:"error"`
+			Status      string          `json:"status"`
+			StatusCode  int             `json:"status_code"`
+			LatencyMs   int64           `json:"latency_ms"`
+			Data        json.RawMessage `json:"data"`
+			ReceiptJSON string          `json:"receipt_json"`
+			Error       string          `json:"error"`
 		}
 
-		if err := json.NewDecoder(statusResp.Body).Decode(&s); err != nil {
-			statusResp.Body.Close()
+		if err := json.NewDecoder(sResp.Body).Decode(&s); err != nil {
+			sResp.Body.Close()
 			continue
 		}
-		statusResp.Body.Close()
+		sResp.Body.Close()
 
-		if s.Status == "completed" || s.Status == "failed" {
-			taskStdout = s.Stdout
-			receiptJSON = s.ReceiptJSON
-			taskErr = s.Error
-			break
-		}
-	}
+		if s.Status == "completed" {
+			fmt.Println("\n==================================================")
+			fmt.Println("       EXTRACTION SUCCESSFUL (RESIDENTIAL NODE)")
+			fmt.Printf("  HTTP Status: %d\n", s.StatusCode)
+			fmt.Printf("  Latency:     %d ms\n", s.LatencyMs)
+			fmt.Println("==================================================")
 
-	if taskErr != "" {
-		fmt.Printf("ERROR: Task execution failed: %s\n", taskErr)
-		return
-	}
-
-	// Print the task output
-	fmt.Println(" -> Task output received:")
-	fmt.Print(taskStdout)
-
-	if len(receiptJSON) > 0 {
-		var receipt ComputeReceipt
-		err := json.Unmarshal([]byte(receiptJSON), &receipt)
-		if err == nil {
-			// Verify signature locally
-			isValid, verifyErr := VerifyReceipt(&receipt, receipt.WorkerID)
-			if verifyErr == nil && isValid {
-				fmt.Println("\n========================================")
-				fmt.Println(" COMPUTE RECEIPT RECEIVED & VERIFIED")
-				fmt.Printf("  Task ID:         %d\n", receipt.TaskID)
-				fmt.Printf("  Worker Peer ID:  %s\n", receipt.WorkerID)
-				fmt.Printf("  Execution Time:  %.2f ms\n", receipt.ExecutionTimeMs)
-				fmt.Printf("  Rate:            %.4f credits/ms\n", receipt.PricePerMs)
-				fmt.Printf("  Cost Charged:    %.6f credits\n", receipt.TotalPrice)
-				fmt.Printf("  Signature:       %s...\n", receipt.Signature[:16])
-				fmt.Println("========================================")
-
-				// Process billing locally (simulated)
-				ledger, err := LoadLedger()
-				if err == nil {
-					// Deduct from sender, add to worker
-					senderID := "local-client"
-					senderBal := ledger.GetBalance(senderID)
-					if senderBal == 0 {
-						senderBal = 100.0 // Default starting balance
-					}
-					ledger.SetBalance(senderID, senderBal-receipt.TotalPrice)
-					
-					workerBal := ledger.GetBalance(receipt.WorkerID)
-					ledger.SetBalance(receipt.WorkerID, workerBal+receipt.TotalPrice)
-					
-					ledger.Save()
-					fmt.Printf("[BILLING] Local account balance updated. Current: %.6f credits\n", ledger.GetBalance(senderID))
-				}
+			var prettyJSON bytes.Buffer
+			if err := json.Indent(&prettyJSON, s.Data, "", "  "); err == nil {
+				fmt.Println(prettyJSON.String())
 			} else {
-				fmt.Printf("\n[BILLING] Cryptographic Verification Failure: Mismatched worker signature.\n")
+				fmt.Println(string(s.Data))
 			}
-		} else {
-			fmt.Printf("\n[BILLING] Received invalid receipt JSON: %v\n", err)
+
+			if s.ReceiptJSON != "" {
+				var r ExtractionReceipt
+				if err := json.Unmarshal([]byte(s.ReceiptJSON), &r); err == nil {
+					fmt.Println("\n[RECEIPT] Cryptographically Signed Extraction Receipt:")
+					fmt.Printf("  Worker Peer: %s...\n", r.WorkerID[:16])
+					fmt.Printf("  Signature:   %s...\n", r.Signature[:24])
+				}
+			}
+			return
+		} else if s.Status == "failed" {
+			fmt.Printf("\nERROR: Extraction failed: %s\n", s.Error)
+			return
 		}
 	}
 }

@@ -20,12 +20,9 @@ func main() {
 		os.Setenv("EMDASH_BROKER_ADDR", GlobalBrokerAddr)
 	}
 
-	// Disable local API server port for normal hosts to maximize security
 	enableAPI := false
 	apiPort := "8085"
-
-	// Set a default pricing rate (can be overridden by EMDASH_PRICE_RATE env)
-	priceRate := 0.01
+	pricePerTask := 1.0
 
 	fmt.Println(" _____ ___  ___ ______   ___   _____  _   _ ")
 	fmt.Println("|  ___||  \\/  ||  _  \\  / _ \\ /  ___|| | | |")
@@ -35,12 +32,11 @@ func main() {
 	fmt.Println("\\____/ \\_|  |_/|___/   \\_| |_/\\____/ \\_| |_/")
 	fmt.Println("")
 	fmt.Println("====================================================")
-	fmt.Println("                EMDASH WORKER NODE")
+	fmt.Println("       EMDASH RESIDENTIAL EXTRACTION NODE")
 	fmt.Println("====================================================")
 
 	worker := &core.Worker{
-		Hooks:      core.DefaultHooks,
-		PricePerMs: priceRate,
+		PricePerTask: pricePerTask,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -55,7 +51,6 @@ func main() {
 		cancel()
 	}()
 
-	// Start worker execution
 	err := worker.Start(ctx, enableAPI, apiPort)
 	if err != nil {
 		fmt.Printf("Fatal worker execution error: %v\n", err)

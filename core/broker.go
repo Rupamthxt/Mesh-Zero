@@ -1,30 +1,30 @@
 package core
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
-	quickjswasi "github.com/paralin/go-quickjs-wasi"
 )
 
 type WorkerConnection struct {
-	ID         string  `json:"id"`
-	PricePerMs float64 `json:"price_per_ms"`
-	Tier       int     `json:"tier"`
-	Conn       *websocket.Conn
-	Busy       bool
+	ID            string  `json:"id"`
+	IP            string  `json:"ip"`
+	Country       string  `json:"country"`
+	CountryCode   string  `json:"country_code"`
+	City          string  `json:"city"`
+	ISP           string  `json:"isp"`
+	PricePerTask  float64 `json:"price_per_task"`
+	Conn          *websocket.Conn
+	Busy          bool
+	CompletedJobs int `json:"completed_jobs"`
 }
 
 type Broker struct {
@@ -45,26 +45,16 @@ type Broker struct {
 func NewBroker() *Broker {
 	b := &Broker{
 		workers:      make(map[string]*WorkerConnection),
-		taskQueue:    make(chan uint64, 1000),
+		taskQueue:    make(chan uint64, 5000),
 		activeTasks:  make(map[uint64]string),
 		taskWaiters:  make(map[uint64][]chan struct{}),
 		batchWaiters: make(map[int64][]chan struct{}),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
-				// Backend workers connect via WebSocket and do not carry browser Origin headers
-				if r.URL.Path == "/ws/worker" {
-					return true
-				}
-				allowedOrigin := os.Getenv("EMDASH_ALLOWED_ORIGIN")
-				if allowedOrigin == "" {
-					return true // Development mode
-				}
-				origin := r.Header.Get("Origin")
-				return origin == allowedOrigin
+				return true
 			},
 		},
 	}
-	// Start the background matchmaking scheduler loop
 	go b.startScheduler()
 	return b
 }
@@ -91,47 +81,48 @@ func (b *Broker) notifyBatch(parentID int64) {
 	}
 }
 
-
-type RegisterPayload struct {
-	ID         string  `json:"id"`
-	PricePerMs float64 `json:"price_per_ms"`
-	Tier       int     `json:"tier"`
-}
-
-type TaskDispatch struct {
-	TaskID    uint64 `json:"task_id"`
-	WasmBytes []byte `json:"wasm_bytes"`
-	DataBytes []byte `json:"data_bytes"`
-}
-
-type TaskResponse struct {
-	TaskID      uint64 `json:"task_id"`
-	Stdout      []byte `json:"stdout"`
-	ReceiptJSON []byte `json:"receipt_json"`
-	Error       string `json:"error"`
-}
-
 func (b *Broker) Start(port string) error {
-	// Ensure DB is initialized on start
 	if err := InitDB(); err != nil {
-		return fmt.Errorf("failed to init db: %v", err)
+		return fmt.Errorf("failed to init db: %w", err)
 	}
 
 	mux := http.NewServeMux()
+
+	// Worker WebSocket gateway
 	mux.HandleFunc("/ws/worker", b.handleWorkerWS)
-	mux.HandleFunc("/api/tasks/submit", b.handleTaskSubmit)
-	mux.HandleFunc("/api/tasks/status", b.handleTaskStatus)
-	mux.HandleFunc("/api/workers", b.handleGetWorkers)
+
+	// AI Agent & Developer Extraction REST Endpoints
+	mux.HandleFunc("/api/extract", b.handleExtract)
+	mux.HandleFunc("/api/extract/status", b.handleExtractStatus)
+	mux.HandleFunc("/api/extract/batch", b.handleExtractBatch)
+	mux.HandleFunc("/api/extract/batch-status", b.handleExtractBatchStatus)
+
+	// Residential Nodes Fleet status
+	mux.HandleFunc("/api/nodes", b.handleGetNodes)
+	mux.HandleFunc("/api/workers", b.handleGetNodes) // Alias
+
+	// Billing & Payouts
 	mux.HandleFunc("/api/billing/checkout", b.handleCheckout)
 	mux.HandleFunc("/api/billing/stripe-webhook", b.handleStripeWebhook)
 	mux.HandleFunc("/api/billing/simulate-success", b.handleSimulateSuccess)
 	mux.HandleFunc("/api/payouts/request", b.handlePayoutRequest)
 	mux.HandleFunc("/api/payouts/list", b.handlePayoutList)
 	mux.HandleFunc("/api/payouts/approve", b.handlePayoutApprove)
-	mux.HandleFunc("/api/tasks/submit-batch", b.handleTaskSubmitBatch)
-	mux.HandleFunc("/api/tasks/batch-status", b.handleTaskBatchStatus)
 
-	fmt.Printf("[BROKER] Starting Central Broker Gateway on http://localhost:%s\n", port)
+	// Health check
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		b.workersMu.RLock()
+		onlineNodes := len(b.workers)
+		b.workersMu.RUnlock()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":       "healthy",
+			"online_nodes": onlineNodes,
+			"timestamp":    time.Now().Unix(),
+		})
+	})
+
+	fmt.Printf("[BROKER] Residential Web Extraction Gateway running on http://localhost:%s\n", port)
 	return http.ListenAndServe(":"+port, mux)
 }
 
@@ -140,54 +131,74 @@ func (b *Broker) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	// The first message is registration
+
+	// 1. First message must be Node Registration payload
 	_, msg, err := conn.ReadMessage()
 	if err != nil {
 		conn.Close()
 		return
 	}
-	var reg RegisterPayload
+
+	var reg struct {
+		ID           string  `json:"id"`
+		IP           string  `json:"ip"`
+		Country      string  `json:"country"`
+		CountryCode  string  `json:"country_code"`
+		City         string  `json:"city"`
+		ISP          string  `json:"isp"`
+		PricePerTask float64 `json:"price_per_task"`
+	}
+
 	if err := json.Unmarshal(msg, &reg); err != nil {
 		conn.Close()
 		return
 	}
 
+	if reg.PricePerTask <= 0 {
+		reg.PricePerTask = 1.0
+	}
+
 	worker := &WorkerConnection{
-		ID:         reg.ID,
-		PricePerMs: reg.PricePerMs,
-		Tier:       reg.Tier,
-		Conn:       conn,
-		Busy:       false,
+		ID:            reg.ID,
+		IP:            reg.IP,
+		Country:       reg.Country,
+		CountryCode:   strings.ToUpper(reg.CountryCode),
+		City:          reg.City,
+		ISP:           reg.ISP,
+		PricePerTask:  reg.PricePerTask,
+		Conn:          conn,
+		Busy:          false,
+		CompletedJobs: 0,
 	}
 
 	b.workersMu.Lock()
 	b.workers[reg.ID] = worker
 	b.workersMu.Unlock()
 
-	fmt.Printf("[BROKER] Worker %s registered (Tier: %d | Price: %.4f credits/ms)\n", reg.ID[:8], reg.Tier, reg.PricePerMs)
+	fmt.Printf("[BROKER] Residential Node Registered: %s | %s, %s (%s) | ISP: %s\n",
+		reg.ID[:8], reg.City, reg.Country, reg.CountryCode, reg.ISP)
 
-	// Keep connection alive & route replies
+	// Keep connection alive & handle job completions
 	defer func() {
 		b.workersMu.Lock()
 		delete(b.workers, reg.ID)
 		b.workersMu.Unlock()
 		conn.Close()
-		fmt.Printf("[BROKER] Worker %s disconnected\n", reg.ID[:8])
+		fmt.Printf("[BROKER] Residential Node %s disconnected\n", reg.ID[:8])
 
-		// Connection resilience: find any running tasks assigned to this worker and re-queue them
+		// Fault Tolerance: Re-queue in-flight tasks assigned to this disconnected worker
 		b.activeTasksMu.Lock()
-		var tasksToRequeue []uint64
+		var toRequeue []uint64
 		for taskID, wID := range b.activeTasks {
 			if wID == reg.ID {
-				tasksToRequeue = append(tasksToRequeue, taskID)
+				toRequeue = append(toRequeue, taskID)
 			}
 		}
-		for _, taskID := range tasksToRequeue {
+		for _, taskID := range toRequeue {
 			delete(b.activeTasks, taskID)
-			// Reset status in DB and push back to scheduler queue
-			_ = UpdateTaskDB(taskID, "pending", nil, nil, "")
+			_ = UpdateTaskDB(taskID, "pending", 0, 0, nil, nil, "")
 			b.taskQueue <- taskID
-			fmt.Printf("[RESILIENCE] Re-queued task %d due to worker disconnect\n", taskID)
+			fmt.Printf("[RESILIENCE] Re-queued extraction job #%d due to node disconnect\n", taskID)
 		}
 		b.activeTasksMu.Unlock()
 	}()
@@ -200,14 +211,13 @@ func (b *Broker) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 
 		var resp TaskResponse
 		if err := json.Unmarshal(msgBytes, &resp); err != nil {
-			fmt.Printf("[BROKER ERROR] Failed to unmarshal task response from worker: %v\n", err)
 			continue
 		}
 		if resp.TaskID == 0 {
 			continue
 		}
 
-		// Retrieve parentID before database update
+		// Retrieve parentID before DB update
 		var parentID int64
 		if tRec, dbErr := GetTaskDB(resp.TaskID); dbErr == nil {
 			parentID = tRec.ParentID
@@ -217,10 +227,12 @@ func (b *Broker) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 		delete(b.activeTasks, resp.TaskID)
 		b.activeTasksMu.Unlock()
 
-		// Mark worker as idle
 		b.workersMu.Lock()
-		if w, ok := b.workers[reg.ID]; ok {
-			w.Busy = false
+		if wk, ok := b.workers[reg.ID]; ok {
+			wk.Busy = false
+			if resp.Error == "" {
+				wk.CompletedJobs++
+			}
 		}
 		b.workersMu.Unlock()
 
@@ -229,121 +241,145 @@ func (b *Broker) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 			status = "failed"
 		}
 
-		// Update SQLite database with completion results
-		if err := UpdateTaskDB(resp.TaskID, status, resp.Stdout, resp.ReceiptJSON, resp.Error); err != nil {
-			fmt.Printf("[DATABASE ERROR] Failed to update task %d status: %v\n", resp.TaskID, err)
-		} else {
-			// Trigger long-polling notifications
-			b.notifyTask(resp.TaskID)
-			if parentID != 0 {
-				b.notifyBatch(parentID)
-			}
+		// Update database with extraction result
+		_ = UpdateTaskDB(resp.TaskID, status, resp.StatusCode, resp.LatencyMs, resp.ResultJSON, resp.ReceiptJSON, resp.Error)
+
+		// Credit worker node if extraction was successful
+		if status == "completed" {
+			currentBal := GetBalanceDB(reg.ID)
+			_ = SetBalanceDB(reg.ID, currentBal+worker.PricePerTask)
+		}
+
+		b.notifyTask(resp.TaskID)
+		if parentID != 0 {
+			b.notifyBatch(parentID)
 		}
 	}
 }
 
-func (b *Broker) handleTaskSubmit(w http.ResponseWriter, r *http.Request) {
-	// Enable CORS for frontend website
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
+// REST: Submit single URL extraction job
+func (b *Broker) handleExtract(w http.ResponseWriter, r *http.Request) {
+	if setupCORS(w, r) {
 		return
 	}
-
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Parse multipart form
-	r.ParseMultipartForm(10 << 20)
+	var req ExtractionRequest
+	contentType := r.Header.Get("Content-Type")
 
-	script := r.FormValue("script")
-	var wasmBytes []byte
-	var dataBytes []byte
-
-	if script != "" {
-		// Use embedded QuickJS interpreter
-		wasmBytes = quickjswasi.QuickJSWASM
-		if strings.Contains(script, "navigator.gpu") || strings.Contains(script, "requestAdapter") {
-			script = WebGPUPolyfill + "\n" + script
+	if strings.Contains(contentType, "application/json") {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(bodyBytes, &req); err != nil {
+			http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+			return
 		}
-		dataBytes = []byte(script)
 	} else {
-		// Fallback to standard WASM binary upload + input data
-		wasmFile, _, err := r.FormFile("wasm")
-		if err == nil {
-			defer wasmFile.Close()
-			wasmBytes, _ = io.ReadAll(wasmFile)
+		req.URL = r.FormValue("url")
+		req.Country = r.FormValue("country")
+		req.ExtractScript = r.FormValue("extract_script")
+		if tStr := r.FormValue("timeout_sec"); tStr != "" {
+			req.TimeoutSec, _ = strconv.Atoi(tStr)
 		}
-
-		templateID := r.FormValue("template_id")
-		if templateID != "" {
-			var wasmPath string
-			switch templateID {
-			case "hasher":
-				wasmPath = "cmd/emdash/hasher.wasm"
-			case "gpu_task":
-				wasmPath = "task/gpu_task.wasm"
-			}
-			var rErr error
-			wasmBytes, rErr = os.ReadFile(wasmPath)
-			if rErr != nil {
-				wasmBytes, rErr = os.ReadFile("../" + wasmPath)
-				if rErr != nil {
-					wasmBytes, _ = os.ReadFile("../../" + wasmPath)
-				}
-			}
-		}
-
-		if len(wasmBytes) == 0 {
-			http.Error(w, "Missing wasm task payload or script", http.StatusBadRequest)
-			return
-		}
-
-		dataFile, _, err := r.FormFile("data")
-		if err != nil {
-			http.Error(w, "Missing data input", http.StatusBadRequest)
-			return
-		}
-		defer dataFile.Close()
-		dataBytes, _ = io.ReadAll(dataFile)
 	}
 
-	targetTier := 0 // 0 means any tier
-	if tierStr := r.FormValue("tier"); tierStr != "" {
-		fmt.Sscanf(tierStr, "%d", &targetTier)
-	}
-
-	taskID := uint64(time.Now().UnixNano())
-
-	// Create task record in pending state in SQLite
-	err := CreateTaskDB(taskID, wasmBytes, dataBytes, targetTier)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to queue task in DB: %v", err), http.StatusInternalServerError)
+	if req.URL == "" {
+		http.Error(w, `Missing "url" parameter`, http.StatusBadRequest)
 		return
 	}
 
-	// Push task to scheduler queue
+	// Validate target URL for safety compliance
+	if err := ValidateTargetURL(req.URL); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": fmt.Sprintf("Target URL violates safety policy: %v", err),
+		})
+		return
+	}
+
+	taskID := uint64(time.Now().UnixNano())
+	if err := CreateTaskDB(taskID, req.URL, strings.ToUpper(req.Country), req.ExtractScript, 0); err != nil {
+		http.Error(w, fmt.Sprintf("Database error: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Push task to scheduler
 	b.taskQueue <- taskID
 
-	// Return response immediately
+	// Check if caller wants synchronous response (e.g. ?sync=true)
+	isSync := r.URL.Query().Get("sync") == "true" || r.URL.Query().Get("wait") == "true"
+	if isSync {
+		t := b.waitForTask(taskID, 25*time.Second)
+		w.Header().Set("Content-Type", "application/json")
+		if t == nil {
+			w.WriteHeader(http.StatusGatewayTimeout)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": "Extraction timed out waiting for node execution",
+			})
+			return
+		}
+
+		var parsedData interface{}
+		if t.ResultJSON != "" {
+			_ = json.Unmarshal([]byte(t.ResultJSON), &parsedData)
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"task_id":      fmt.Sprintf("%d", t.ID),
+			"url":          t.URL,
+			"status":       t.Status,
+			"status_code":  t.StatusCode,
+			"latency_ms":   t.LatencyMs,
+			"data":         parsedData,
+			"receipt_json": t.ReceiptJSON,
+			"error":        t.Error,
+		})
+		return
+	}
+
+	// Default: Asynchronous submission
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"task_id": fmt.Sprintf("%d", taskID),
-		"status":  "pending",
+		"status":     "pending",
+		"task_id":    fmt.Sprintf("%d", taskID),
+		"status_url": fmt.Sprintf("/api/extract/status?id=%d", taskID),
 	})
 }
 
-func (b *Broker) handleTaskStatus(w http.ResponseWriter, r *http.Request) {
-	// Enable CORS for frontend website
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
+func (b *Broker) waitForTask(taskID uint64, timeout time.Duration) *TaskRecord {
+	t, err := GetTaskDB(taskID)
+	if err != nil {
+		return nil
+	}
+	if t.Status == "completed" || t.Status == "failed" {
+		return t
+	}
+
+	notifyChan := make(chan struct{})
+	b.taskWaitersMu.Lock()
+	b.taskWaiters[taskID] = append(b.taskWaiters[taskID], notifyChan)
+	b.taskWaitersMu.Unlock()
+
+	select {
+	case <-notifyChan:
+		refreshed, _ := GetTaskDB(taskID)
+		return refreshed
+	case <-time.After(timeout):
+		b.taskWaitersMu.Lock()
+		delete(b.taskWaiters, taskID)
+		b.taskWaitersMu.Unlock()
+		refreshed, _ := GetTaskDB(taskID)
+		return refreshed
+	}
+}
+
+// REST: Check status of single extraction job (supports long-polling)
+func (b *Broker) handleExtractStatus(w http.ResponseWriter, r *http.Request) {
+	if setupCORS(w, r) {
 		return
 	}
 
@@ -355,81 +391,174 @@ func (b *Broker) handleTaskStatus(w http.ResponseWriter, r *http.Request) {
 
 	taskID, err := strconv.ParseUint(idStr, 10, 64)
 	if err != nil {
-		http.Error(w, "Invalid task id", http.StatusBadRequest)
+		http.Error(w, "Invalid task ID", http.StatusBadRequest)
 		return
 	}
 
-	// Fetch task from DB
-	t, err := GetTaskDB(taskID)
-	if err != nil {
+	t := b.waitForTask(taskID, 15*time.Second)
+	if t == nil {
 		http.Error(w, "Task not found", http.StatusNotFound)
 		return
 	}
 
-	// Long-polling: If task is still executing/pending, wait for completion notification
-	if t.Status == "pending" || t.Status == "running" {
-		notifyChan := make(chan struct{})
-
-		b.taskWaitersMu.Lock()
-		b.taskWaiters[taskID] = append(b.taskWaiters[taskID], notifyChan)
-		b.taskWaitersMu.Unlock()
-
-		select {
-		case <-notifyChan:
-			// Task status changed! Refresh task record
-			if refreshed, err := GetTaskDB(taskID); err == nil {
-				t = refreshed
-			}
-		case <-time.After(20 * time.Second):
-			// Safe timeout to release HTTP connection; clean up listener channel
-			b.taskWaitersMu.Lock()
-			if waiters, ok := b.taskWaiters[taskID]; ok {
-				var newWaiters []chan struct{}
-				for _, ch := range waiters {
-					if ch != notifyChan {
-						newWaiters = append(newWaiters, ch)
-					}
-				}
-				if len(newWaiters) == 0 {
-					delete(b.taskWaiters, taskID)
-				} else {
-					b.taskWaiters[taskID] = newWaiters
-				}
-			}
-			b.taskWaitersMu.Unlock()
-		}
+	var parsedData interface{}
+	if t.ResultJSON != "" {
+		_ = json.Unmarshal([]byte(t.ResultJSON), &parsedData)
 	}
 
-	// Return status JSON
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"task_id":      fmt.Sprintf("%d", t.ID),
+		"url":          t.URL,
 		"status":       t.Status,
-		"stdout":       string(t.Stdout),
+		"status_code":  t.StatusCode,
+		"latency_ms":   t.LatencyMs,
+		"data":         parsedData,
 		"receipt_json": t.ReceiptJSON,
 		"error":        t.Error,
-		"tier":         t.Tier,
 		"created_at":   t.CreatedAt,
 	})
 }
 
-func (b *Broker) handleGetWorkers(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
+// REST: Batch URL extraction
+func (b *Broker) handleExtractBatch(w http.ResponseWriter, r *http.Request) {
+	if setupCORS(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		URLs          []string `json:"urls"`
+		Country       string   `json:"country,omitempty"`
+		ExtractScript string   `json:"extract_script,omitempty"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	if len(req.URLs) == 0 {
+		http.Error(w, "URLs array cannot be empty", http.StatusBadRequest)
+		return
+	}
+
+	parentID := int64(time.Now().UnixNano())
+	country := strings.ToUpper(req.Country)
+
+	for i, u := range req.URLs {
+		if err := ValidateTargetURL(u); err != nil {
+			continue // Skip URLs violating safety policy
+		}
+
+		subTaskID := uint64(time.Now().UnixNano()) + uint64(i)
+		_ = CreateTaskDB(subTaskID, u, country, req.ExtractScript, parentID)
+		b.taskQueue <- subTaskID
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":      "success",
+		"batch_id":    fmt.Sprintf("%d", parentID),
+		"tasks_count": len(req.URLs),
+		"status_url":  fmt.Sprintf("/api/extract/batch-status?batch_id=%d", parentID),
+	})
+}
+
+// REST: Check status of batch extraction
+func (b *Broker) handleExtractBatchStatus(w http.ResponseWriter, r *http.Request) {
+	if setupCORS(w, r) {
+		return
+	}
+
+	parentIDStr := r.URL.Query().Get("batch_id")
+	if parentIDStr == "" {
+		http.Error(w, "Missing batch_id", http.StatusBadRequest)
+		return
+	}
+
+	parentID, err := strconv.ParseInt(parentIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid batch_id", http.StatusBadRequest)
+		return
+	}
+
+	records, err := GetBatchTasksDB(parentID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Database error: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	completedCount := 0
+	failedCount := 0
+	pendingCount := 0
+
+	var results []map[string]interface{}
+	for _, rec := range records {
+		if rec.Status == "completed" {
+			completedCount++
+		} else if rec.Status == "failed" {
+			failedCount++
+		} else {
+			pendingCount++
+		}
+
+		var parsedData interface{}
+		if rec.ResultJSON != "" {
+			_ = json.Unmarshal([]byte(rec.ResultJSON), &parsedData)
+		}
+
+		results = append(results, map[string]interface{}{
+			"id":          fmt.Sprintf("%d", rec.ID),
+			"url":         rec.URL,
+			"status":      rec.Status,
+			"status_code": rec.StatusCode,
+			"latency_ms":  rec.LatencyMs,
+			"data":        parsedData,
+			"error":       rec.Error,
+		})
+	}
+
+	overallStatus := "in_progress"
+	if pendingCount == 0 {
+		overallStatus = "completed"
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"batch_id":    fmt.Sprintf("%d", parentID),
+		"status":      overallStatus,
+		"total":       len(records),
+		"completed":   completedCount,
+		"failed":      failedCount,
+		"pending":     pendingCount,
+		"extractions": results,
+	})
+}
+
+// REST: List all registered residential nodes
+func (b *Broker) handleGetNodes(w http.ResponseWriter, r *http.Request) {
+	if setupCORS(w, r) {
 		return
 	}
 
 	b.workersMu.RLock()
 	var list []map[string]interface{}
-	for _, worker := range b.workers {
+	for _, wk := range b.workers {
 		list = append(list, map[string]interface{}{
-			"id":           worker.ID,
-			"price_per_ms": worker.PricePerMs,
-			"tier":         worker.Tier,
-			"busy":         worker.Busy,
-			"balance":      GetBalanceDB(worker.ID),
+			"id":             wk.ID[:16] + "...",
+			"ip":             wk.IP,
+			"country":        wk.Country,
+			"country_code":   wk.CountryCode,
+			"city":           wk.City,
+			"isp":            wk.ISP,
+			"price_per_task": wk.PricePerTask,
+			"busy":           wk.Busy,
+			"completed_jobs": wk.CompletedJobs,
+			"balance":        GetBalanceDB(wk.ID),
 		})
 	}
 	b.workersMu.RUnlock()
@@ -441,26 +570,23 @@ func (b *Broker) handleGetWorkers(w http.ResponseWriter, r *http.Request) {
 // Background scheduler matchmaking loop
 func (b *Broker) startScheduler() {
 	for taskID := range b.taskQueue {
-		// Fetch task details from SQLite database
 		t, err := GetTaskDB(taskID)
-		if err != nil {
+		if err != nil || t.Status != "pending" {
 			continue
 		}
 
-		// If task was already processed or cancelled, skip
-		if t.Status != "pending" {
-			continue
-		}
-
-		// Find an idle worker matching the task's tier
 		var targetWorker *WorkerConnection
+
+		// Wait and match an idle worker (matching target country if specified)
 		for {
 			b.workersMu.Lock()
 			for _, worker := range b.workers {
-				if !worker.Busy && (t.Tier == 0 || worker.Tier == t.Tier) {
-					targetWorker = worker
-					worker.Busy = true
-					break
+				if !worker.Busy {
+					if t.Country == "" || worker.CountryCode == t.Country {
+						targetWorker = worker
+						worker.Busy = true
+						break
+					}
 				}
 			}
 			b.workersMu.Unlock()
@@ -468,22 +594,22 @@ func (b *Broker) startScheduler() {
 			if targetWorker != nil {
 				break
 			}
-			// Wait a bit before trying to match again if no workers are available
+
 			time.Sleep(500 * time.Millisecond)
 
-			// Re-verify that task hasn't timed out or changed status
-			tCheck, err := GetTaskDB(taskID)
-			if err != nil || tCheck.Status != "pending" {
-				break
-			}
-
-			// Simple execution expiry timeout: if task is older than 30s, fail it
-			if time.Now().UnixNano()-t.CreatedAt > int64(30*time.Second) {
-				_ = UpdateTaskDB(taskID, "failed", nil, nil, "Task matching timed out: no suitable worker online")
+			// Timeout check: if no suitable residential node is online after 45s, fail task
+			if time.Now().UnixNano()-t.CreatedAt > int64(45*time.Second) {
+				_ = UpdateTaskDB(taskID, "failed", 0, 0, nil, nil, "No suitable residential node online for specified country")
 				b.notifyTask(taskID)
 				if t.ParentID != 0 {
 					b.notifyBatch(t.ParentID)
 				}
+				break
+			}
+
+			// Verify task status hasn't changed
+			tCheck, err := GetTaskDB(taskID)
+			if err != nil || tCheck.Status != "pending" {
 				break
 			}
 		}
@@ -492,36 +618,36 @@ func (b *Broker) startScheduler() {
 			continue
 		}
 
-		// Register active task mapping
+		// Map active task
 		b.activeTasksMu.Lock()
 		b.activeTasks[taskID] = targetWorker.ID
 		b.activeTasksMu.Unlock()
 
-		// Update status to running in DB
-		_ = UpdateTaskDB(taskID, "running", nil, nil, "")
+		_ = UpdateTaskDB(taskID, "running", 0, 0, nil, nil, "")
 
-		// Dispatch job via WebSocket
+		// Dispatch to worker over WebSocket
 		dispatch := TaskDispatch{
-			TaskID:    taskID,
-			WasmBytes: t.WasmBytes,
-			DataBytes: t.DataBytes,
+			TaskID:        taskID,
+			URL:           t.URL,
+			ExtractScript: t.ExtractScript,
+			TimeoutSec:    15,
 		}
-		dispatchMsg, _ := json.Marshal(dispatch)
+		msg, _ := json.Marshal(dispatch)
 
-		err = targetWorker.Conn.WriteMessage(websocket.TextMessage, dispatchMsg)
+		err = targetWorker.Conn.WriteMessage(websocket.TextMessage, msg)
 		if err != nil {
-			// WebSocket write error: clean active mapping, mark worker idle, and re-queue task
+			// Write failed: re-queue task and mark worker idle
 			b.activeTasksMu.Lock()
 			delete(b.activeTasks, taskID)
 			b.activeTasksMu.Unlock()
 
 			b.workersMu.Lock()
-			if w, ok := b.workers[targetWorker.ID]; ok {
-				w.Busy = false
+			if wk, ok := b.workers[targetWorker.ID]; ok {
+				wk.Busy = false
 			}
 			b.workersMu.Unlock()
 
-			_ = UpdateTaskDB(taskID, "pending", nil, nil, "")
+			_ = UpdateTaskDB(taskID, "pending", 0, 0, nil, nil, "")
 			b.taskQueue <- taskID
 		}
 	}
@@ -561,27 +687,10 @@ func (b *Broker) handleCheckout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	secretKey := os.Getenv("STRIPE_SECRET_KEY")
-	if secretKey == "" {
-		// Fallback to simulation mode redirect
-		mockRedirectURL := fmt.Sprintf("http://localhost:8080/api/billing/simulate-success?account_id=%s&amount=%f", url.QueryEscape(accountID), amount)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"url": mockRedirectURL,
-		})
-		return
-	}
-
-	// Real Stripe checkout session
-	sessionURL, err := createStripeCheckoutSession(amount, accountID)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Stripe checkout error: %v", err), http.StatusInternalServerError)
-		return
-	}
-
+	mockRedirectURL := fmt.Sprintf("http://localhost:8080/api/billing/simulate-success?account_id=%s&amount=%f", url.QueryEscape(accountID), amount)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"url": sessionURL,
+		"url": mockRedirectURL,
 	})
 }
 
@@ -598,72 +707,20 @@ func (b *Broker) handleSimulateSuccess(w http.ResponseWriter, r *http.Request) {
 	}
 
 	amount, _ := strconv.ParseFloat(amountStr, 64)
-	credits := amount * 100.0 // $1 USD = 100 credits
+	credits := amount * 100.0 // $1 = 100 extraction credits
 
 	currentBalance := GetBalanceDB(accountID)
 	_ = SetBalanceDB(accountID, currentBalance+credits)
 
-	// Redirect back to console dashboard (detect host from referrer if available)
-	redirectURL := "http://localhost:3000/console.html?success=true"
-	if ref := r.Header.Get("Referer"); ref != "" {
-		if u, err := url.Parse(ref); err == nil {
-			redirectURL = fmt.Sprintf("%s://%s/console.html?success=true", u.Scheme, u.Host)
-		}
-	}
-	http.Redirect(w, r, redirectURL, http.StatusSeeOther)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":      "success",
+		"account_id":  accountID,
+		"new_balance": currentBalance + credits,
+	})
 }
 
 func (b *Broker) handleStripeWebhook(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	webhookSecret := os.Getenv("STRIPE_WEBHOOK_SECRET")
-	payload, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Failed to read request body", http.StatusBadRequest)
-		return
-	}
-
-	if webhookSecret != "" {
-		sigHeader := r.Header.Get("Stripe-Signature")
-		if !verifyStripeSignature(payload, sigHeader, webhookSecret) {
-			http.Error(w, "Invalid Stripe webhook signature", http.StatusUnauthorized)
-			return
-		}
-	}
-
-	var stripeEvent struct {
-		Type string `json:"type"`
-		Data struct {
-			Object struct {
-				Metadata struct {
-					AccountID string `json:"account_id"`
-					Amount    string `json:"amount"`
-				} `json:"metadata"`
-			} `json:"object"`
-		} `json:"data"`
-	}
-
-	if err := json.Unmarshal(payload, &stripeEvent); err != nil {
-		http.Error(w, "Invalid webhook JSON", http.StatusBadRequest)
-		return
-	}
-
-	if stripeEvent.Type == "checkout.session.completed" {
-		accountID := stripeEvent.Data.Object.Metadata.AccountID
-		amountStr := stripeEvent.Data.Object.Metadata.Amount
-		if accountID != "" && amountStr != "" {
-			amount, _ := strconv.ParseFloat(amountStr, 64)
-			credits := amount * 100.0 // $1 USD = 100 credits
-
-			currentBal := GetBalanceDB(accountID)
-			_ = SetBalanceDB(accountID, currentBal+credits)
-			fmt.Printf("[BILLING] Stripe Webhook successfully processed. Deposited %.2f credits to %s\n", credits, accountID)
-		}
-	}
-
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -671,48 +728,28 @@ func (b *Broker) handlePayoutRequest(w http.ResponseWriter, r *http.Request) {
 	if setupCORS(w, r) {
 		return
 	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	workerID := r.FormValue("worker_id")
 	amountStr := r.FormValue("amount")
 
-	if workerID == "" || amountStr == "" {
-		http.Error(w, "Missing worker_id or amount", http.StatusBadRequest)
-		return
-	}
-
-	amount, err := strconv.ParseFloat(amountStr, 64)
-	if err != nil || amount <= 0 {
-		http.Error(w, "Invalid amount", http.StatusBadRequest)
+	amount, _ := strconv.ParseFloat(amountStr, 64)
+	if workerID == "" || amount <= 0 {
+		http.Error(w, "Invalid payout parameters", http.StatusBadRequest)
 		return
 	}
 
 	currentBal := GetBalanceDB(workerID)
 	if currentBal < amount {
-		http.Error(w, "Insufficient credit balance for payout", http.StatusBadRequest)
+		http.Error(w, "Insufficient balance", http.StatusBadRequest)
 		return
 	}
 
-	err = SetBalanceDB(workerID, currentBal-amount)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to update balance: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	err = CreatePayoutRequestDB(workerID, amount)
-	if err != nil {
-		_ = SetBalanceDB(workerID, currentBal) // Rollback
-		http.Error(w, fmt.Sprintf("Failed to record request: %v", err), http.StatusInternalServerError)
-		return
-	}
+	_ = SetBalanceDB(workerID, currentBal-amount)
+	_ = CreatePayoutRequestDB(workerID, amount)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
 		"status":  "success",
-		"message": "Payout request successfully submitted and is pending approval",
+		"message": "Payout requested successfully",
 	})
 }
 
@@ -720,17 +757,7 @@ func (b *Broker) handlePayoutList(w http.ResponseWriter, r *http.Request) {
 	if setupCORS(w, r) {
 		return
 	}
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	requests, err := GetPayoutRequestsDB()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to retrieve payout requests: %v", err), http.StatusInternalServerError)
-		return
-	}
-
+	requests, _ := GetPayoutRequestsDB()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(requests)
 }
@@ -739,451 +766,10 @@ func (b *Broker) handlePayoutApprove(w http.ResponseWriter, r *http.Request) {
 	if setupCORS(w, r) {
 		return
 	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	idStr := r.FormValue("id")
 	status := r.FormValue("status")
-
-	if idStr == "" || (status != "approved" && status != "rejected") {
-		http.Error(w, "Missing or invalid parameters", http.StatusBadRequest)
-		return
-	}
-
-	id, err := strconv.ParseInt(idStr, 10, 64)
-	if err != nil {
-		http.Error(w, "Invalid ID format", http.StatusBadRequest)
-		return
-	}
-
-	err = UpdatePayoutRequestStatusDB(id, status)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to update status: %v", err), http.StatusInternalServerError)
-		return
-	}
-
+	id, _ := strconv.ParseInt(idStr, 10, 64)
+	_ = UpdatePayoutRequestStatusDB(id, status)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "success",
-		"message": fmt.Sprintf("Payout request marked as %s", status),
-	})
+	json.NewEncoder(w).Encode(map[string]string{"status": "success"})
 }
-
-func createStripeCheckoutSession(amount float64, accountID string) (string, error) {
-	secretKey := os.Getenv("STRIPE_SECRET_KEY")
-	if secretKey == "" {
-		return "", fmt.Errorf("STRIPE_SECRET_KEY not configured")
-	}
-
-	apiURL := "https://api.stripe.com/v1/checkout/sessions"
-	data := url.Values{}
-	data.Set("mode", "payment")
-	data.Set("success_url", "https://emdash.world/console.html?session_id={CHECKOUT_SESSION_ID}&success=true")
-	data.Set("cancel_url", "https://emdash.world/console.html?success=false")
-	data.Set("line_items[0][price_data][currency]", "usd")
-	cents := int64(amount * 100)
-	data.Set("line_items[0][price_data][unit_amount]", fmt.Sprintf("%d", cents))
-	data.Set("line_items[0][price_data][product_data][name]", "Emdash Compute Credits")
-	data.Set("line_items[0][quantity]", "1")
-	data.Set("metadata[account_id]", accountID)
-	data.Set("metadata[amount]", fmt.Sprintf("%f", amount))
-
-	req, err := http.NewRequest("POST", apiURL, strings.NewReader(data.Encode()))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.SetBasicAuth(secretKey, "")
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("stripe error (status %d): %s", resp.StatusCode, string(body))
-	}
-
-	var session struct {
-		URL string `json:"url"`
-	}
-	if err := json.Unmarshal(body, &session); err != nil {
-		return "", err
-	}
-
-	return session.URL, nil
-}
-
-func verifyStripeSignature(payload []byte, sigHeader, webhookSecret string) bool {
-	if sigHeader == "" || webhookSecret == "" {
-		return false
-	}
-
-	parts := strings.Split(sigHeader, ",")
-	var timestamp string
-	var signature string
-	for _, part := range parts {
-		kv := strings.SplitN(part, "=", 2)
-		if len(kv) == 2 {
-			switch kv[0] {
-			case "t":
-				timestamp = kv[1]
-			case "v1":
-				signature = kv[1]
-			}
-		}
-	}
-
-	if timestamp == "" || signature == "" {
-		return false
-	}
-
-	signedPayload := timestamp + "." + string(payload)
-
-	mac := hmac.New(sha256.New, []byte(webhookSecret))
-	mac.Write([]byte(signedPayload))
-	expectedMac := hex.EncodeToString(mac.Sum(nil))
-
-	return hmac.Equal([]byte(signature), []byte(expectedMac))
-}
-
-func (b *Broker) handleTaskSubmitBatch(w http.ResponseWriter, r *http.Request) {
-	if setupCORS(w, r) {
-		return
-	}
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	script := r.FormValue("script")
-	inputsJSON := r.FormValue("inputs")
-	tierStr := r.FormValue("tier")
-
-	if script == "" || inputsJSON == "" {
-		http.Error(w, "Missing script or inputs", http.StatusBadRequest)
-		return
-	}
-
-	if strings.Contains(script, "navigator.gpu") || strings.Contains(script, "requestAdapter") {
-		script = WebGPUPolyfill + "\n" + script
-	}
-
-	var inputs []string
-	if err := json.Unmarshal([]byte(inputsJSON), &inputs); err != nil {
-		http.Error(w, "Invalid inputs JSON format (must be string array)", http.StatusBadRequest)
-		return
-	}
-
-	if len(inputs) == 0 {
-		http.Error(w, "Inputs array cannot be empty", http.StatusBadRequest)
-		return
-	}
-
-	targetTier := 0
-	if tierStr != "" {
-		fmt.Sscanf(tierStr, "%d", &targetTier)
-	}
-
-	parentID := int64(time.Now().UnixNano())
-	wasmBytes := quickjswasi.QuickJSWASM
-
-	// Queue all sub-tasks in parallel
-	for i, input := range inputs {
-		subTaskID := uint64(time.Now().UnixNano()) + uint64(i)
-
-		// Prepend target URL parameter to the script scope
-		wrappedScript := fmt.Sprintf("const __INPUT__ = %q;\n%s", input, script)
-
-		err := CreateTaskDBWithParent(subTaskID, wasmBytes, []byte(wrappedScript), targetTier, parentID)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to queue batch subtask: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		// Queue the task for the scheduler matchmaking loop
-		b.taskQueue <- subTaskID
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":      "success",
-		"batch_id":    fmt.Sprintf("%d", parentID),
-		"tasks_count": len(inputs),
-		"message":     fmt.Sprintf("Batch job queued with %d parallel scraping tasks", len(inputs)),
-	})
-}
-
-func (b *Broker) handleTaskBatchStatus(w http.ResponseWriter, r *http.Request) {
-	if setupCORS(w, r) {
-		return
-	}
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	parentIDStr := r.URL.Query().Get("parent_id")
-	if parentIDStr == "" {
-		http.Error(w, "Missing parent_id", http.StatusBadRequest)
-		return
-	}
-
-	parentID, err := strconv.ParseInt(parentIDStr, 10, 64)
-	if err != nil {
-		http.Error(w, "Invalid parent_id format", http.StatusBadRequest)
-		return
-	}
-
-	records, err := GetBatchTasksDB(parentID)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to fetch batch tasks: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	total := len(records)
-	if total == 0 {
-		http.Error(w, "No tasks found for the specified batch ID", http.StatusNotFound)
-		return
-	}
-
-	// Count completed/failed tasks
-	finishedCount := 0
-	for _, rec := range records {
-		if rec.Status == "completed" || rec.Status == "failed" {
-			finishedCount++
-		}
-	}
-
-	// Long-polling: If batch is not yet finished, wait for updates
-	if finishedCount < total {
-		notifyChan := make(chan struct{})
-
-		b.batchWaitersMu.Lock()
-		b.batchWaiters[parentID] = append(b.batchWaiters[parentID], notifyChan)
-		b.batchWaitersMu.Unlock()
-
-		select {
-		case <-notifyChan:
-			// A subtask updated! Re-read from DB
-			if refreshed, err := GetBatchTasksDB(parentID); err == nil {
-				records = refreshed
-				total = len(records)
-			}
-		case <-time.After(20 * time.Second):
-			// Safe timeout to release connection; clean up listener channel
-			b.batchWaitersMu.Lock()
-			if waiters, ok := b.batchWaiters[parentID]; ok {
-				var newWaiters []chan struct{}
-				for _, ch := range waiters {
-					if ch != notifyChan {
-						newWaiters = append(newWaiters, ch)
-					}
-				}
-				if len(newWaiters) == 0 {
-					delete(b.batchWaiters, parentID)
-				} else {
-					b.batchWaiters[parentID] = newWaiters
-				}
-			}
-			b.batchWaitersMu.Unlock()
-		}
-	}
-
-	pendingCount := 0
-	runningCount := 0
-	completedCount := 0
-	failedCount := 0
-
-	var outputs []string
-	var errors []string
-
-	for _, rec := range records {
-		switch rec.Status {
-		case "pending":
-			pendingCount++
-		case "running":
-			runningCount++
-		case "completed":
-			completedCount++
-			outputs = append(outputs, string(rec.Stdout))
-		case "failed":
-			failedCount++
-			errors = append(errors, rec.Error)
-		}
-	}
-
-	progressPercent := float64(completedCount+failedCount) / float64(total) * 100.0
-	status := "running"
-	if completedCount+failedCount == total {
-		if failedCount > 0 {
-			status = "failed"
-		} else {
-			status = "completed"
-		}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"batch_id":         fmt.Sprintf("%d", parentID),
-		"status":           status,
-		"progress_percent": progressPercent,
-		"tasks_total":      total,
-		"tasks_pending":    pendingCount,
-		"tasks_running":    runningCount,
-		"tasks_completed":  completedCount,
-		"tasks_failed":     failedCount,
-		"outputs":          outputs,
-		"errors":           errors,
-	})
-}
-
-const WebGPUPolyfill = `
-// WebGPU Headless Polyfill shim for QuickJS WASM
-globalThis.GPUMapMode = { READ: 1, WRITE: 2 };
-globalThis.GPUBufferUsage = {
-	STORAGE: 1,
-	COPY_SRC: 2,
-	COPY_DST: 4,
-	MAP_READ: 8
-};
-
-class MockGPUBuffer {
-	constructor(desc) {
-		this.size = desc.size;
-		this.usage = desc.usage;
-		this.mapped = desc.mappedAtCreation || false;
-		this.data = new Float32Array(this.size / 4);
-	}
-	getMappedRange() {
-		return this.data.buffer;
-	}
-	unmap() {
-		this.mapped = false;
-	}
-	mapAsync(mode) {
-		return Promise.resolve();
-	}
-}
-
-class MockGPUDevice {
-	constructor() {
-		this.activeShader = "";
-		this.activeBindGroup = null;
-		this.resultBuffer = null;
-		
-		this.pendingCopies = [];
-		this.queue = {
-			writeBuffer: (buffer, offset, data) => {
-				buffer.data.set(data);
-			},
-			submit: (encoders) => {
-				// Evaluate the shader math natively inside the javascript runtime:
-				// Map input buffer values and calculate output values dynamically.
-				if (this.activeBindGroup) {
-					const entries = this.activeBindGroup.entries;
-					const firstEntry = entries.find(e => e.binding === 0);
-					const secondEntry = entries.find(e => e.binding === 1);
-					const thirdEntry = entries.find(e => e.binding === 2);
-					
-					if (firstEntry && secondEntry && !thirdEntry) {
-						// 2-buffer unary operations (e.g. inputData * inputData squaring)
-						const first = firstEntry.resource.buffer.data;
-						const result = secondEntry.resource.buffer.data;
-						
-						let op = (a) => a * a; // Default square operator
-						if (this.activeShader.includes("+")) op = (a) => a + a;
-						else if (this.activeShader.includes("-")) op = (a) => 0;
-
-						for (let i = 0; i < first.length; i++) {
-							result[i] = op(first[i]);
-						}
-					} else if (firstEntry && secondEntry && thirdEntry) {
-						// 3-buffer binary operations (e.g. first * second = result)
-						const first = firstEntry.resource.buffer.data;
-						const second = secondEntry.resource.buffer.data;
-						const result = thirdEntry.resource.buffer.data;
-						
-						let op = (a, b) => a * b; // Default operation multiplication
-						if (this.activeShader.includes("+")) op = (a, b) => a + b;
-						else if (this.activeShader.includes("-")) op = (a, b) => a - b;
-						else if (this.activeShader.includes("/")) op = (a, b) => a / b;
-
-						for (let i = 0; i < first.length; i++) {
-							result[i] = op(first[i], second[i]);
-						}
-					}
-				}
-				
-				// Execute deferred copy commands
-				this.pendingCopies.forEach(cp => cp());
-				this.pendingCopies = [];
-			}
-		};
-	}
-	createBuffer(desc) {
-		const buf = new MockGPUBuffer(desc);
-		if (desc.usage & 8) { // MAP_READ buffer reference
-			this.resultBuffer = buf;
-		}
-		return buf;
-	}
-	createShaderModule(desc) {
-		this.activeShader = desc.code;
-		return desc;
-	}
-	createComputePipeline(desc) {
-		return {
-			getBindGroupLayout: (idx) => ({})
-		};
-	}
-	createBindGroup(desc) {
-		this.activeBindGroup = desc;
-		return desc;
-	}
-	createCommandEncoder() {
-		return {
-			beginComputePass: () => ({
-				setPipeline: () => {},
-				setBindGroup: () => {},
-				dispatchWorkgroups: () => {},
-				end: () => {}
-			}),
-			copyBufferToBuffer: (src, srcOff, dst, dstOff, size) => {
-				this.pendingCopies.push(() => {
-					dst.data.set(src.data);
-				});
-			},
-			finish: () => {}
-		};
-	}
-}
-
-Object.defineProperty(globalThis, 'navigator', {
-	value: {
-		gpu: {
-			requestAdapter: async () => ({
-				requestDevice: async () => new MockGPUDevice()
-			})
-		}
-	},
-	writable: true,
-	configurable: true
-});
-
-globalThis.document = {
-	getElementById: (id) => ({
-		set innerText(val) {
-			console.log("[DOM " + id + "] " + val);
-		},
-		get innerText() {
-			return "";
-		}
-	})
-};
-`
